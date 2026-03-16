@@ -1145,6 +1145,43 @@ USER root
 
 #########################################################################################
 #
+# Layer "rust-extensions-build-pgrx16"
+# Build environment for pgrx 0.16.x extensions (e.g., pg_search)
+#
+#########################################################################################
+FROM pg-build-with-cargo AS rust-extensions-build-pgrx16
+ARG PG_VERSION
+
+RUN cargo install --locked --version 0.16.1 cargo-pgrx && \
+    /bin/bash -c 'cargo pgrx init --pg${PG_VERSION:1}=/usr/local/pgsql/bin/pg_config'
+
+USER root
+
+#########################################################################################
+#
+# Layer "pg_search-build"
+# Compile ParadeDB pg_search (BM25 full-text search)
+#
+#########################################################################################
+FROM build-deps AS pg_search-src
+ARG PG_VERSION
+WORKDIR /ext-src
+RUN wget https://github.com/paradedb/paradedb/archive/refs/tags/v0.21.15.tar.gz -O pg_search.tar.gz && \
+    mkdir pg_search-src && cd pg_search-src && tar xzf ../pg_search.tar.gz --strip-components=1 -C .
+
+FROM rust-extensions-build-pgrx16 AS pg_search-build
+COPY --from=pg_search-src /ext-src/ /ext-src/
+WORKDIR /ext-src/pg_search-src/pg_search
+RUN \
+    # Enable unsafe-postgres feature for Neon ABI compatibility
+    sed -i 's/pgrx = "=0.16.1"/pgrx = { version = "=0.16.1", features = ["unsafe-postgres"] }/g' Cargo.toml && \
+    sed -i 's/pgrx.workspace = true/pgrx = { version = "=0.16.1", features = ["unsafe-postgres"] }/g' Cargo.toml && \
+    sed -i 's/pgrx-tests.workspace = true/pgrx-tests = "=0.16.1"/g' Cargo.toml && \
+    cargo pgrx install --release && \
+    echo "trusted = true" >> /usr/local/pgsql/share/extension/pg_search.control
+
+#########################################################################################
+#
 # Layers "pg-onnx-build" and "pgrag-build"
 # Compile "pgrag" extensions
 #
@@ -1712,6 +1749,7 @@ COPY --from=pg_duckdb-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_repack-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pgaudit-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pgauditlogtofile-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=pg_search-build /usr/local/pgsql/ /usr/local/pgsql/
 
 #########################################################################################
 #

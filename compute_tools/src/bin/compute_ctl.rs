@@ -231,8 +231,10 @@ fn main() -> Result<()> {
 
     let (tracing_provider, _file_logs_guard) = init(cli.dev, log_dir)?;
 
-    // enable core dumping for all child processes
-    setrlimit(Resource::CORE, rlimit::INFINITY, rlimit::INFINITY)?;
+    // enable core dumping for all child processes (best-effort: may fail on CCI/Autopilot)
+    if let Err(e) = setrlimit(Resource::CORE, rlimit::INFINITY, rlimit::INFINITY) {
+        eprintln!("WARN: setrlimit(CORE, INFINITY) failed: {e} — continuing without core dumps");
+    }
 
     if cli.lakebase_mode {
         installed_extensions::initialize_metrics();
