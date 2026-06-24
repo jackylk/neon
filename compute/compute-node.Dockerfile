@@ -1171,13 +1171,16 @@ RUN wget https://github.com/paradedb/paradedb/archive/refs/tags/v0.21.15.tar.gz 
 
 FROM rust-extensions-build-pgrx16 AS pg_search-build
 COPY --from=pg_search-src /ext-src/ /ext-src/
+COPY compute/patches/pg_search.patch /ext-src/pg_search-src/
+WORKDIR /ext-src/pg_search-src
+RUN patch -p1 < pg_search.patch
 WORKDIR /ext-src/pg_search-src/pg_search
 RUN \
     # Enable unsafe-postgres feature for Neon ABI compatibility
     sed -i 's/pgrx = "=0.16.1"/pgrx = { version = "=0.16.1", features = ["unsafe-postgres"] }/g' Cargo.toml && \
     sed -i 's/pgrx.workspace = true/pgrx = { version = "=0.16.1", features = ["unsafe-postgres"] }/g' Cargo.toml && \
     sed -i 's/pgrx-tests.workspace = true/pgrx-tests = "=0.16.1"/g' Cargo.toml && \
-    cargo pgrx install --release && \
+    cargo pgrx install --release --features neon && \
     echo "trusted = true" >> /usr/local/pgsql/share/extension/pg_search.control
 
 #########################################################################################

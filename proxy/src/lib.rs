@@ -93,6 +93,7 @@ mod ext;
 mod http;
 mod intern;
 mod jemalloc;
+mod lakeon_pooler;
 mod logging;
 mod metrics;
 mod parse;

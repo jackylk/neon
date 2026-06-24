@@ -1,0 +1,501 @@
+diff --git a/pg_search/Cargo.toml b/pg_search/Cargo.toml
+index 91d8903..ec7de94 100644
+--- a/pg_search/Cargo.toml
++++ b/pg_search/Cargo.toml
+@@ -20,6 +20,7 @@ pg_test = []
+ icu = ["tokenizers/icu"]
+ unsafe-postgres = ["pgrx/unsafe-postgres"]
+ block_tracker = [] # for debugging when blocks are acquired and released
++neon = []
+ debug-logging = [
+   "dep:env_logger",
+ ] # enables env_logger for dependency debug output
+diff --git a/pg_search/src/postgres/build.rs b/pg_search/src/postgres/build.rs
+index 0ce3450..ac349e9 100644
+--- a/pg_search/src/postgres/build.rs
++++ b/pg_search/src/postgres/build.rs
+@@ -29,6 +29,58 @@ use tantivy::schema::Schema;
+ use tantivy::{Index, IndexSettings};
+ use tokenizers::SearchTokenizer;
+ 
++/// Neon compatibility: FFI declarations for Neon's unlogged build hooks.
++///
++/// Neon's disaggregated storage requires all persistent data to go through WAL.
++/// During index builds, PostgreSQL normally skips WAL-logging and logs everything
++/// at the end. Neon's pageserver cannot reconstruct evicted pages without WAL,
++/// causing "zero LSN" PANIC. These hooks redirect writes to local storage during
++/// the build phase, then WAL-log everything at the end.
++#[cfg(feature = "neon")]
++pub(crate) mod neon_compat {
++    use pgrx::pg_sys;
++
++    extern "C" {
++        // Neon-specific unlogged build hooks (from neon's smgr.h)
++        pub fn smgr_start_unlogged_build(reln: pg_sys::SMgrRelation);
++        pub fn smgr_finish_unlogged_build_phase_1(reln: pg_sys::SMgrRelation);
++        pub fn smgr_end_unlogged_build(reln: pg_sys::SMgrRelation);
++
++        // Standard PG functions that pgrx may not bind
++        fn smgropen(
++            rlocator: pg_sys::RelFileLocator,
++            backend: pg_sys::ProcNumber,
++            relpersistence: std::ffi::c_char,
++        ) -> pg_sys::SMgrRelation;
++        fn smgrpin(reln: pg_sys::SMgrRelation);
++        pub fn log_newpage_range(
++            rel: pg_sys::Relation,
++            forknum: i32,  // pg_sys::ForkNumber is a module in pgrx, underlying type is i32
++            startblk: pg_sys::BlockNumber,
++            endblk: pg_sys::BlockNumber,
++            page_std: bool,
++        );
++    }
++
++    /// Ensure the relation's SMgrRelation is open and return it.
++    pub unsafe fn relation_get_smgr(rel: pg_sys::Relation) -> pg_sys::SMgrRelation {
++        if (*rel).rd_smgr.is_null() {
++            (*rel).rd_smgr = smgropen(
++                (*rel).rd_locator,
++                (*rel).rd_backend,
++                (*(*rel).rd_rel).relpersistence,
++            );
++            smgrpin((*rel).rd_smgr);
++        }
++        (*rel).rd_smgr
++    }
++
++    /// Check if the relation needs WAL logging (i.e., is permanent).
++    pub unsafe fn relation_needs_wal(rel: pg_sys::Relation) -> bool {
++        (*(*rel).rd_rel).relpersistence == pg_sys::RELPERSISTENCE_PERMANENT as i8
++    }
++}
++
+ #[pg_guard]
+ pub extern "C-unwind" fn ambuild(
+     heaprel: pg_sys::Relation,
+@@ -39,6 +91,13 @@ pub extern "C-unwind" fn ambuild(
+     let mut index_relation = unsafe { PgSearchRelation::from_pg(indexrel) };
+     index_relation.set_is_create_index();
+ 
++    // Neon: redirect buffer writes to local storage during index build
++    #[cfg(feature = "neon")]
++    unsafe {
++        let smgr = neon_compat::relation_get_smgr(indexrel);
++        neon_compat::smgr_start_unlogged_build(smgr);
++    }
++
+     unsafe {
+         build_empty(&index_relation);
+     }
+@@ -75,6 +134,29 @@ pub extern "C-unwind" fn ambuild(
+         pgrx::debug1!("build_index: flushing buffers");
+         pg_sys::FlushRelationBuffers(indexrel);
+ 
++        // Neon: transition to WAL-logging phase, log all pages, then clean up
++        #[cfg(feature = "neon")]
++        {
++            let smgr = neon_compat::relation_get_smgr(indexrel);
++            neon_compat::smgr_finish_unlogged_build_phase_1(smgr);
++
++            if neon_compat::relation_needs_wal(indexrel) {
++                let nblocks = pg_sys::RelationGetNumberOfBlocksInFork(
++                    indexrel,
++                    pg_sys::ForkNumber::MAIN_FORKNUM,
++                );
++                neon_compat::log_newpage_range(
++                    indexrel,
++                    pg_sys::ForkNumber::MAIN_FORKNUM,
++                    0,
++                    nblocks,
++                    true,
++                );
++            }
++
++            neon_compat::smgr_end_unlogged_build(smgr);
++        }
++
+         let mut result = PgBox::<pg_sys::IndexBuildResult>::alloc0();
+         result.heap_tuples = heap_tuples;
+         result.index_tuples = heap_tuples;
+diff --git a/pg_search/src/postgres/build_parallel.rs b/pg_search/src/postgres/build_parallel.rs
+index 6df2985..00767e0 100644
+--- a/pg_search/src/postgres/build_parallel.rs
++++ b/pg_search/src/postgres/build_parallel.rs
+@@ -206,6 +206,14 @@ impl ParallelWorker for BuildWorker<'_> {
+     }
+ 
+     fn run(mut self, mq_sender: &MessageQueueSender, worker_number: i32) -> anyhow::Result<()> {
++        // Neon: parallel workers must also redirect writes to local storage
++        #[cfg(feature = "neon")]
++        unsafe {
++            use crate::postgres::build::neon_compat;
++            let smgr = neon_compat::relation_get_smgr(self.indexrel.as_ptr());
++            neon_compat::smgr_start_unlogged_build(smgr);
++        }
++
+         // wait for the leader to tell us how many total workers have been launched
+         while self.coordination.nlaunched() == 0 {
+             check_for_interrupts!();
+@@ -216,6 +224,15 @@ impl ParallelWorker for BuildWorker<'_> {
+         self.coordination.inc_nstarted();
+ 
+         let (reltuples, nmerges) = self.do_build(worker_number)?;
++
++        // Neon: workers call finish_phase_1 only; leader handles WAL-logging and end
++        #[cfg(feature = "neon")]
++        unsafe {
++            use crate::postgres::build::neon_compat;
++            let smgr = neon_compat::relation_get_smgr(self.indexrel.as_ptr());
++            neon_compat::smgr_finish_unlogged_build_phase_1(smgr);
++        }
++
+         Ok(mq_sender.send(serde_json::to_vec(&WorkerResponse { reltuples, nmerges })?)?)
+     }
+ }
+diff --git a/pg_search/src/postgres/storage/buffer.rs b/pg_search/src/postgres/storage/buffer.rs
+index 1faf5c8..7c74323 100644
+--- a/pg_search/src/postgres/storage/buffer.rs
++++ b/pg_search/src/postgres/storage/buffer.rs
+@@ -9,6 +9,64 @@ use stable_deref_trait::StableDeref;
+ use std::mem::size_of;
+ use std::ops::Deref;
+ 
++// Neon: GenericXLog WAL support for all buffer modifications.
++// GenericXLog records page-level diffs so Neon's pageserver can reconstruct pages from WAL.
++#[cfg(feature = "neon")]
++mod neon_xlog {
++    use pgrx::pg_sys;
++
++    /// Opaque state for GenericXLog (PG doesn't expose the struct layout)
++    #[repr(C)]
++    pub struct GenericXLogState {
++        _opaque: [u8; 0],
++    }
++
++    pub const GENERIC_XLOG_FULL_IMAGE: i32 = 0x0001;
++
++    extern "C" {
++        pub fn GenericXLogStart(relation: pg_sys::Relation) -> *mut GenericXLogState;
++        pub fn GenericXLogRegisterBuffer(
++            state: *mut GenericXLogState,
++            buffer: pg_sys::Buffer,
++            flags: i32,
++        ) -> pg_sys::Page;
++        pub fn GenericXLogFinish(state: *mut GenericXLogState) -> pg_sys::XLogRecPtr;
++        pub fn GenericXLogAbort(state: *mut GenericXLogState);
++    }
++}
++
++#[cfg(feature = "neon")]
++struct NeonXLogCtx {
++    state: *mut neon_xlog::GenericXLogState,
++    shadow_page: pg_sys::Page,
++}
++
++/// Construct a BufferMut with proper Neon fields.
++/// Usage: `new_buffer_mut!(pg_buffer, relation_expr)` where relation_expr is a pg_sys::Relation.
++macro_rules! new_buffer_mut {
++    ($pg_buffer:expr, $relation:expr) => {
++        BufferMut {
++            dirty: false,
++            inner: Buffer::new($pg_buffer),
++            #[cfg(feature = "neon")]
++            relation: $relation,
++            #[cfg(feature = "neon")]
++            xlog: None,
++        }
++    };
++    // Variant for Buffer { pg_buffer } (non-new_buffer constructor)
++    (raw $pg_buffer:expr, $relation:expr) => {
++        BufferMut {
++            dirty: false,
++            inner: Buffer { pg_buffer: $pg_buffer },
++            #[cfg(feature = "neon")]
++            relation: $relation,
++            #[cfg(feature = "neon")]
++            xlog: None,
++        }
++    };
++}
++
+ /// A module to help with tracking when/where blocks are acquired and released.
+ ///
+ /// This has quite a bit of runtime overhead so it is only active when the `block_tracker`
+@@ -246,10 +304,7 @@ impl Buffer {
+             .rbufacc
+             .get_buffer(blockno, Some(pg_sys::BUFFER_LOCK_EXCLUSIVE));
+         block_tracker::track!(Write, blockno);
+-        BufferMut {
+-            dirty: false,
+-            inner: Buffer::new(pg_buffer),
+-        }
++        new_buffer_mut!(pg_buffer, bman.relation_ptr())
+     }
+ 
+     pub fn upgrade_conditional(self, bman: &mut BufferManager) -> Option<BufferMut> {
+@@ -258,10 +313,7 @@ impl Buffer {
+ 
+         let pg_buffer = bman.rbufacc.get_buffer_conditional(blockno)?;
+         block_tracker::track!(Write, blockno);
+-        Some(BufferMut {
+-            dirty: false,
+-            inner: Buffer::new(pg_buffer),
+-        })
++        Some(new_buffer_mut!(pg_buffer, bman.relation_ptr()))
+     }
+ }
+ 
+@@ -269,6 +321,18 @@ impl Buffer {
+ pub struct BufferMut {
+     dirty: bool,
+     inner: Buffer,
++    #[cfg(feature = "neon")]
++    relation: pg_sys::Relation,
++    // Not Debug, so manual impl would be needed; but BufferMut derives Debug via inner only
++    #[cfg(feature = "neon")]
++    xlog: Option<NeonXLogCtx>,
++}
++
++#[cfg(feature = "neon")]
++impl std::fmt::Debug for NeonXLogCtx {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("NeonXLogCtx").finish_non_exhaustive()
++    }
+ }
+ 
+ impl Deref for BufferMut {
+@@ -280,6 +344,16 @@ impl Deref for BufferMut {
+ 
+ crate::impl_safe_drop!(BufferMut, |self| {
+     unsafe {
++        #[cfg(feature = "neon")]
++        if let Some(xlog) = self.xlog.take() {
++            if crate::postgres::utils::IsTransactionState() && self.dirty {
++                neon_xlog::GenericXLogFinish(xlog.state);
++            } else {
++                neon_xlog::GenericXLogAbort(xlog.state);
++            }
++            return;
++        }
++
+         if crate::postgres::utils::IsTransactionState() && self.dirty {
+             pg_sys::MarkBufferDirty(self.inner.pg_buffer);
+         }
+@@ -288,6 +362,10 @@ crate::impl_safe_drop!(BufferMut, |self| {
+ 
+ impl BufferMut {
+     pub fn init_page(&mut self) -> PageMut<'_> {
++        // Neon: new pages use FULL_IMAGE (no meaningful "before" to diff against)
++        #[cfg(feature = "neon")]
++        self.ensure_xlog(neon_xlog::GENERIC_XLOG_FULL_IMAGE);
++
+         let page_size = self.page_size();
+         let page = self.page_mut();
+         page.buffer.dirty = true;
+@@ -303,6 +381,14 @@ impl BufferMut {
+ 
+     #[allow(dead_code)]
+     pub fn page(&self) -> Page<'_> {
++        // Neon: if xlog is active, read from shadow page (it has our modifications)
++        #[cfg(feature = "neon")]
++        if let Some(ref xlog) = self.xlog {
++            return Page {
++                pg_page: xlog.shadow_page,
++                _buffer: Some(&self.inner),
++            };
++        }
+         unsafe {
+             Page {
+                 pg_page: pg_sys::BufferGetPage(self.inner.pg_buffer),
+@@ -312,13 +398,46 @@ impl BufferMut {
+     }
+ 
+     pub fn page_mut(&mut self) -> PageMut<'_> {
+-        let pg_page = unsafe { pg_sys::BufferGetPage(self.inner.pg_buffer) };
++        // Neon: lazily start GenericXLog and return shadow page for diff-based WAL
++        #[cfg(feature = "neon")]
++        self.ensure_xlog(0);
++
++        let pg_page = self.writable_page();
+         PageMut {
+             buffer: self,
+             pg_page,
+         }
+     }
+ 
++    /// Get the page pointer for writing. Under Neon, returns the GenericXLog shadow page.
++    fn writable_page(&self) -> pg_sys::Page {
++        #[cfg(feature = "neon")]
++        if let Some(ref xlog) = self.xlog {
++            return xlog.shadow_page;
++        }
++        unsafe { pg_sys::BufferGetPage(self.inner.pg_buffer) }
++    }
++
++    /// Neon: lazily initialize GenericXLog state for this buffer.
++    /// `flags`: 0 for diff mode, GENERIC_XLOG_FULL_IMAGE for new pages.
++    #[cfg(feature = "neon")]
++    fn ensure_xlog(&mut self, flags: i32) {
++        if self.xlog.is_none() {
++            unsafe {
++                let state = neon_xlog::GenericXLogStart(self.relation);
++                let shadow = neon_xlog::GenericXLogRegisterBuffer(
++                    state,
++                    self.inner.pg_buffer,
++                    flags,
++                );
++                self.xlog = Some(NeonXLogCtx {
++                    state,
++                    shadow_page: shadow,
++                });
++            }
++        }
++    }
++
+     pub fn set_dirty(&mut self, is_dirty: bool) {
+         self.dirty = is_dirty
+     }
+@@ -337,6 +456,12 @@ impl BufferMut {
+             "BufferMut::into_immutable_page called on a dirty page"
+         );
+ 
++        // Neon: abort any pending xlog state before downgrading
++        #[cfg(feature = "neon")]
++        if let Some(xlog) = self.xlog.take() {
++            unsafe { neon_xlog::GenericXLogAbort(xlog.state); }
++        }
++
+         let inner = std::mem::replace(
+             &mut self.inner,
+             Buffer {
+@@ -718,6 +843,11 @@ impl BufferManager {
+         }
+     }
+ 
++    #[cfg(feature = "neon")]
++    fn relation_ptr(&self) -> pg_sys::Relation {
++        self.rbufacc.rel().as_ptr()
++    }
++
+     pub fn fsm(&mut self) -> impl FreeSpaceManager {
+         let fsm_blockno = *self
+             .fsm_blockno
+@@ -750,10 +880,7 @@ impl BufferManager {
+                 pg_buffer
+             });
+ 
+-        BufferMut {
+-            dirty: false,
+-            inner: Buffer { pg_buffer },
+-        }
++        new_buffer_mut!(raw pg_buffer, self.relation_ptr())
+     }
+ 
+     /// Like [`new_buffer`], but returns an iterator of buffers instead.
+@@ -767,6 +894,8 @@ impl BufferManager {
+         }
+ 
+         let buffer_access = self.buffer_access().clone();
++        #[cfg(feature = "neon")]
++        let rel_ptr = self.relation_ptr();
+ 
+         let mut fsm_blocknos = self.fsm().drain(self, npages).map(move |blockno| {
+             block_tracker::track!(Write, blockno);
+@@ -776,10 +905,7 @@ impl BufferManager {
+                 pg_sys::ReadBufferMode::RBM_ZERO_AND_LOCK,
+                 None,
+             );
+-            BufferMut {
+-                dirty: false,
+-                inner: Buffer { pg_buffer },
+-            }
++            new_buffer_mut!(raw pg_buffer, rel_ptr)
+         });
+ 
+         let bman = self.clone();
+@@ -799,15 +925,14 @@ impl BufferManager {
+             if new_buffers.is_none() {
+                 // the fsm didn't give us all the buffers we asked for, so we need to get the rest
+                 // by extending the relation with brand new buffers
++                #[cfg(feature = "neon")]
++                let rel_ptr2 = bman.relation_ptr();
+                 new_buffers = Some(bman.buffer_access().new_buffers(remaining_from_fsm).map(
+                     move |pg_buffer| {
+                         block_tracker::track!(Write, unsafe {
+                             pg_sys::BufferGetBlockNumber(pg_buffer)
+                         });
+-                        BufferMut {
+-                            dirty: false,
+-                            inner: Buffer { pg_buffer },
+-                        }
++                        new_buffer_mut!(raw pg_buffer, rel_ptr2)
+                     },
+                 ));
+             }
+@@ -846,13 +971,11 @@ impl BufferManager {
+ 
+     pub fn get_buffer_mut(&mut self, blockno: pg_sys::BlockNumber) -> BufferMut {
+         block_tracker::track!(Write, blockno);
+-        BufferMut {
+-            dirty: false,
+-            inner: Buffer::new(
+-                self.rbufacc
+-                    .get_buffer(blockno, Some(pg_sys::BUFFER_LOCK_EXCLUSIVE)),
+-            ),
+-        }
++        new_buffer_mut!(
++            self.rbufacc
++                .get_buffer(blockno, Some(pg_sys::BUFFER_LOCK_EXCLUSIVE)),
++            self.relation_ptr()
++        )
+     }
+ 
+     ///
+@@ -874,10 +997,7 @@ impl BufferManager {
+             let pg_buffer = self.rbufacc.get_buffer(blockno, None);
+             if pg_sys::ConditionalLockBuffer(pg_buffer) {
+                 block_tracker::track!(Conditional, blockno);
+-                Some(BufferMut {
+-                    dirty: false,
+-                    inner: Buffer::new(pg_buffer),
+-                })
++                Some(new_buffer_mut!(pg_buffer, self.relation_ptr()))
+             } else {
+                 pg_sys::ReleaseBuffer(pg_buffer);
+                 None
+@@ -890,10 +1010,7 @@ impl BufferManager {
+             let pg_buffer = self.rbufacc.get_buffer(blockno, None);
+             block_tracker::track!(Cleanup, blockno);
+             pg_sys::LockBufferForCleanup(pg_buffer);
+-            BufferMut {
+-                dirty: false,
+-                inner: Buffer::new(pg_buffer),
+-            }
++            new_buffer_mut!(pg_buffer, self.relation_ptr())
+         }
+     }
+ 
+@@ -905,10 +1022,7 @@ impl BufferManager {
+             let pg_buffer = self.rbufacc.get_buffer(blockno, None);
+             if pg_sys::ConditionalLockBufferForCleanup(pg_buffer) {
+                 block_tracker::track!(ConditionalCleanup, blockno);
+-                Some(BufferMut {
+-                    dirty: false,
+-                    inner: Buffer::new(pg_buffer),
+-                })
++                Some(new_buffer_mut!(pg_buffer, self.relation_ptr()))
+             } else {
+                 pg_sys::ReleaseBuffer(pg_buffer);
+                 None
+@@ -931,10 +1045,7 @@ pub fn init_new_buffer(rel: &PgSearchRelation) -> BufferMut {
+     let rbacc = RelationBufferAccess::open(rel);
+     let pg_buffer = rbacc.new_buffer();
+ 
+-    let mut buffer = BufferMut {
+-        dirty: false,
+-        inner: Buffer { pg_buffer },
+-    };
++    let mut buffer = new_buffer_mut!(raw pg_buffer, rel.as_ptr());
+     let mut page = buffer.init_page();
+     let special = page.special_mut::<BM25PageSpecialData>();
+     special.next_blockno = pg_sys::InvalidBlockNumber;

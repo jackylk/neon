@@ -235,6 +235,13 @@ struct ProxyCliArgs {
     #[clap(long, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set)]
     is_private_access_proxy: bool,
 
+    /// Enable Lakeon-specific data proxy behavior.
+    ///
+    /// Milestone 1 keeps the existing passthrough behavior and only exposes the
+    /// deployment flag for Lakeon-owned proxy images.
+    #[clap(long, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set)]
+    lakeon_data_proxy: bool,
+
     /// Configure whether all incoming requests have a Proxy Protocol V2 packet.
     #[clap(value_enum, long, default_value_t = ProxyProtocolV2::Rejected)]
     proxy_protocol_v2: ProxyProtocolV2,
@@ -355,6 +362,10 @@ pub async fn run() -> anyhow::Result<()> {
     };
 
     let args = ProxyCliArgs::parse();
+    if args.lakeon_data_proxy {
+        info!("Lakeon data proxy mode enabled");
+    }
+
     let config = build_config(&args)?;
     let auth_backend = build_auth_backend(&args)?;
 
@@ -441,6 +452,7 @@ pub async fn run() -> anyhow::Result<()> {
                     cancellation_token.clone(),
                     cancellation_handler.clone(),
                     endpoint_rate_limiter.clone(),
+                    args.lakeon_data_proxy,
                 ));
             }
 
@@ -999,5 +1011,12 @@ mod tests {
                 RateBucketInfo::new(20, Duration::from_secs(30)),
             ]
         );
+    }
+
+    #[test]
+    fn parse_lakeon_data_proxy_flag() {
+        let config = super::ProxyCliArgs::parse_from(["proxy", "--lakeon-data-proxy=true"]);
+
+        assert!(config.lakeon_data_proxy);
     }
 }

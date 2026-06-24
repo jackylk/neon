@@ -2083,11 +2083,85 @@ impl ComputeNode {
         Ok(())
     }
 
+    /// Check if PG is currently running in recovery (= Replica or Static mode).
+    /// Used by `reconfigure()` to detect Replica → Primary transitions that
+    /// need a full PG re-init (apply_spec_sql can't run DDL on read-only PG).
+    /// dbay-fork addition.
+    fn pg_is_in_recovery(&self) -> Result<bool> {
+        let conf = self.get_tokio_conn_conf(Some("compute_ctl:transition-check"));
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async move {
+            let (client, connection) = conf.connect(NoTls).await?;
+            let conn_task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let row = client.query_one("SELECT pg_is_in_recovery()", &[]).await?;
+            let in_recovery: bool = row.get(0);
+            drop(client);
+            let _ = conn_task.await;
+            Ok::<bool, anyhow::Error>(in_recovery)
+        })
+    }
+
+    /// Stop the running Postgres by SIGTERM-ing the postmaster, then wait
+    /// up to 30s for clean shutdown (postmaster.pid removed).
+    /// Used during Replica → Primary transition. dbay-fork addition.
+    fn stop_postgres_for_transition(&self) -> Result<()> {
+        let pid_file = Path::new(&self.params.pgdata).join("postmaster.pid");
+        let pid_str = std::fs::read_to_string(&pid_file)
+            .with_context(|| format!("reading {}", pid_file.display()))?;
+        let pid: i32 = pid_str
+            .lines()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("empty postmaster.pid"))?
+            .trim()
+            .parse()
+            .context("parsing postmaster pid")?;
+        info!("SIGTERM postmaster pid={} for Replica→Primary transition", pid);
+        kill(Pid::from_raw(pid), Signal::SIGTERM).context("sending SIGTERM to postmaster")?;
+
+        let start = std::time::Instant::now();
+        while pid_file.exists() {
+            if start.elapsed() > std::time::Duration::from_secs(30) {
+                anyhow::bail!("Postgres did not shut down in 30s during transition");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        info!("Postgres stopped, ready for re-init");
+        Ok(())
+    }
+
     /// Similar to `apply_config()`, but does a bit different sequence of operations,
     /// as it's used to reconfigure a previously started and configured Postgres node.
     #[instrument(skip_all)]
     pub fn reconfigure(&self) -> Result<()> {
-        let spec = self.state.lock().unwrap().pspec.clone().unwrap().spec;
+        let compute_state = self.state.lock().unwrap().clone();
+        let spec = compute_state.pspec.clone().unwrap().spec;
+
+        // ── dbay-fork: detect Replica → Primary transition ───────────────
+        // If the new spec wants Primary mode but PG is currently a Replica
+        // (e.g., a warm-pool idle pod being claimed by a real tenant),
+        // apply_spec_sql will fail with "cannot execute ALTER ROLE in a
+        // read-only transaction". Re-init pgdata + restart PG in Primary
+        // mode first, then let the existing reconfigure code proceed.
+        if spec.mode == ComputeMode::Primary {
+            match self.pg_is_in_recovery() {
+                Ok(true) => {
+                    info!("Replica → Primary transition: re-initializing Postgres for new tenant");
+                    self.stop_postgres_for_transition()?;
+                    self.prepare_pgdata(&compute_state)?;
+                    let storage_auth_token =
+                        compute_state.pspec.as_ref().and_then(|p| p.storage_auth_token.clone());
+                    let _new_handle = self.start_postgres(storage_auth_token)?;
+                    info!("Postgres re-initialized in Primary mode, continuing reconfigure");
+                }
+                Ok(false) => {} // Already Primary, fall through to normal reconfigure
+                Err(e) => {
+                    warn!("pg_is_in_recovery check failed (continuing anyway): {}", e);
+                }
+            }
+        }
+        // ── end dbay-fork ────────────────────────────────────────────────
 
         let tls_config = self.tls_config(&spec);
 

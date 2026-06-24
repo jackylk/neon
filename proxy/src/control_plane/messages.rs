@@ -367,6 +367,17 @@ pub(crate) struct MetricsAuxInfo {
     pub(crate) compute_id: SmolStr,
     #[serde(default)]
     pub(crate) cold_start_info: ColdStartInfo,
+    #[serde(default)]
+    pub(crate) pooler_mode: PoolerMode,
+}
+
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PoolerMode {
+    #[default]
+    #[serde(alias = "DIRECT")]
+    Direct,
+    #[serde(alias = "PROXY_POOLED")]
+    ProxyPooled,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, FixedCardinalityLabel)]
@@ -515,6 +526,21 @@ mod tests {
             "aux": dummy_aux(),
         });
         serde_json::from_str::<WakeCompute>(&json.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn parse_lakeon_pooler_mode_from_aux() -> anyhow::Result<()> {
+        let mut aux = dummy_aux();
+        aux["pooler_mode"] = json!("PROXY_POOLED");
+        let json = json!({
+            "address": "0.0.0.0",
+            "aux": aux,
+        });
+
+        let wake = serde_json::from_str::<WakeCompute>(&json.to_string())?;
+
+        assert_eq!(wake.aux.pooler_mode, PoolerMode::ProxyPooled);
         Ok(())
     }
 

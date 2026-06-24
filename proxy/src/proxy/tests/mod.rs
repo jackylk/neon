@@ -14,9 +14,10 @@ use postgres_client::tls::{MakeTlsConnect, NoTls};
 use rstest::rstest;
 use rustls::crypto::ring;
 use rustls::pki_types;
-use tokio::io::{AsyncRead, AsyncWrite, DuplexStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, DuplexStream};
 use tokio::time::Instant;
 use tracing_test::traced_test;
+use zerocopy::IntoBytes;
 
 use super::retry::CouldRetry;
 use crate::auth::backend::{ComputeUserInfo, MaybeOwned};
@@ -29,15 +30,40 @@ use crate::control_plane::{self, NodeInfo};
 use crate::error::ErrorKind;
 use crate::pglb::ERR_INSECURE_CONNECTION;
 use crate::pglb::handshake::{HandshakeData, handshake};
-use crate::pqproto::BeMessage;
+use crate::pqproto::{BeMessage, id_to_cancel_key};
 use crate::proxy::NeonOptions;
 use crate::proxy::connect_compute::{ConnectMechanism, connect_to_compute_inner};
 use crate::proxy::retry::retry_after;
+use crate::proxy::{StartupReplay, StartupReplayFrame};
 use crate::stream::{PqStream, Stream};
 use crate::tls::client_config::compute_client_config_with_certs;
 use crate::tls::server_config::CertResolver;
 use crate::types::{BranchId, EndpointId, ProjectId};
 use crate::{auth, compute, sasl, scram};
+
+#[tokio::test]
+async fn lakeon_startup_replay_uses_fresh_backend_key_data() {
+    let first_key = id_to_cancel_key(1);
+    let replay_key = id_to_cancel_key(2);
+    let mut replay = StartupReplay::default();
+    replay.frames.push(StartupReplayFrame::BackendKeyData);
+
+    let (mut server, client) = tokio::io::duplex(128);
+    let mut client = PqStream::new_skip_handshake(Stream::from_raw(client));
+    replay.write_to(&mut client, replay_key);
+    client.flush().await.unwrap();
+
+    let mut frame = [0_u8; 13];
+    server.read_exact(&mut frame).await.unwrap();
+
+    assert_eq!(frame[0], b'K');
+    assert_eq!(
+        u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]),
+        12
+    );
+    assert_ne!(&frame[5..], first_key.as_bytes());
+    assert_eq!(&frame[5..], replay_key.as_bytes());
+}
 
 /// Generate a set of TLS certificates: CA + server.
 fn generate_certs(
@@ -541,6 +567,7 @@ fn helper_create_uncached_node_info() -> NodeInfo {
             branch_id: (&BranchId::from("branch")).into(),
             compute_id: "compute".into(),
             cold_start_info: crate::control_plane::messages::ColdStartInfo::Warm,
+            pooler_mode: crate::control_plane::messages::PoolerMode::Direct,
         },
     }
 }
