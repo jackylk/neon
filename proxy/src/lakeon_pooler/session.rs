@@ -15,7 +15,7 @@ use crate::metrics::{
 };
 use crate::pglb::copy_bidirectional::ErrorSource;
 use crate::proxy::{BackendCancelInfo, StartupReplay};
-use crate::stream::Stream;
+use crate::stream::{PqStream, Stream};
 
 const MAX_POOLED_MESSAGE_BYTES: u32 = 16 * 1024 * 1024;
 
@@ -46,6 +46,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> LakeonPooledSession<S> {
         let result = proxy_transaction_aware(self.client, &mut backend.compute).await;
         if matches!(result, Ok(BackendTransactionStatus::Idle)) {
             self.pool.release_idle(self.pool_key, backend).await;
+        } else {
+            self.pool.release_checked_out(&self.pool_key).await;
         }
         result.map(|_| ())
     }
@@ -177,7 +179,7 @@ async fn read_frame(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<Option<
     Ok(Some(PgFrame { tag, body }))
 }
 
-async fn write_pooler_error(
+pub(crate) async fn write_pooler_error(
     client: &mut (impl AsyncWrite + Unpin),
     message: &str,
 ) -> io::Result<()> {
@@ -196,5 +198,21 @@ async fn write_pooler_error(
         body: vec![b'I'],
     };
     client.write_all(&ready.to_wire()).await?;
+    client.flush().await
+}
+
+pub(crate) async fn write_pooler_error_to_pq_stream<S: AsyncWrite + Unpin>(
+    client: &mut PqStream<S>,
+    message: &str,
+) -> io::Result<()> {
+    client.write_raw(18 + message.len(), b'E', |buf| {
+        buf.extend_from_slice(b"SERROR\0");
+        buf.extend_from_slice(b"C0A000\0");
+        buf.push(b'M');
+        buf.extend_from_slice(message.as_bytes());
+        buf.push(0);
+        buf.push(0);
+    });
+    client.write_raw(1, b'Z', |buf| buf.push(b'I'));
     client.flush().await
 }

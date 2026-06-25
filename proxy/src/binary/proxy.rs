@@ -242,6 +242,10 @@ struct ProxyCliArgs {
     #[clap(long, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set)]
     lakeon_data_proxy: bool,
 
+    /// Maximum pooled backend connections per endpoint/database/user key in this proxy pod.
+    #[clap(long, default_value_t = 20)]
+    lakeon_pooler_max_backends_per_key: usize,
+
     /// Configure whether all incoming requests have a Proxy Protocol V2 packet.
     #[clap(value_enum, long, default_value_t = ProxyProtocolV2::Rejected)]
     proxy_protocol_v2: ProxyProtocolV2,
@@ -453,6 +457,7 @@ pub async fn run() -> anyhow::Result<()> {
                     cancellation_handler.clone(),
                     endpoint_rate_limiter.clone(),
                     args.lakeon_data_proxy,
+                    args.lakeon_pooler_max_backends_per_key,
                 ));
             }
 
@@ -1018,5 +1023,15 @@ mod tests {
         let config = super::ProxyCliArgs::parse_from(["proxy", "--lakeon-data-proxy=true"]);
 
         assert!(config.lakeon_data_proxy);
+    }
+
+    #[test]
+    fn parse_lakeon_pooler_max_backends_per_key() {
+        let config = super::ProxyCliArgs::parse_from([
+            "proxy",
+            "--lakeon-pooler-max-backends-per-key=7",
+        ]);
+
+        assert_eq!(config.lakeon_pooler_max_backends_per_key, 7);
     }
 }

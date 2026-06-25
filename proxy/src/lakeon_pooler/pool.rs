@@ -13,20 +13,52 @@ pub(crate) struct PoolKey {
     role: String,
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub(crate) struct LakeonBackendPool {
-    idle: Arc<Mutex<HashMap<PoolKey, VecDeque<PooledBackend>>>>,
+    inner: Arc<Mutex<PoolInner>>,
+    max_backends_per_key: usize,
 }
 
 impl LakeonBackendPool {
+    pub(crate) fn new(max_backends_per_key: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(PoolInner::default())),
+            max_backends_per_key,
+        }
+    }
+
     pub(crate) async fn checkout_idle(&self, key: &PoolKey) -> Option<PooledBackend> {
-        let mut idle = self.idle.lock().await;
-        idle.get_mut(key).and_then(VecDeque::pop_front)
+        let mut inner = self.inner.lock().await;
+        let pool = inner.pools.get_mut(key)?;
+        let backend = pool.idle.pop_front()?;
+        pool.checked_out += 1;
+        Some(backend)
+    }
+
+    pub(crate) async fn try_reserve_new(&self, key: &PoolKey) -> Result<(), CheckoutError> {
+        let mut inner = self.inner.lock().await;
+        inner.try_reserve_new(key.clone(), self.max_backends_per_key)
     }
 
     pub(crate) async fn release_idle(&self, key: PoolKey, backend: PooledBackend) {
-        let mut idle = self.idle.lock().await;
-        idle.entry(key).or_default().push_back(backend);
+        let mut inner = self.inner.lock().await;
+        inner.release_idle(key, backend);
+    }
+
+    pub(crate) async fn release_checked_out(&self, key: &PoolKey) {
+        let mut inner = self.inner.lock().await;
+        inner.release_checked_out(key);
+    }
+
+    pub(crate) async fn stats(&self) -> PoolStats {
+        let inner = self.inner.lock().await;
+        stats_for_pools(inner.pools.values())
+    }
+}
+
+impl Default for LakeonBackendPool {
+    fn default() -> Self {
+        Self::new(20)
     }
 }
 
@@ -42,9 +74,63 @@ impl PoolKey {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(test)]
 pub(crate) enum CheckoutError {
     PoolFull,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PoolStats {
+    pub(crate) pools: usize,
+    pub(crate) checked_out: usize,
+    pub(crate) idle: usize,
+    pub(crate) total: usize,
+}
+
+#[derive(Default)]
+struct PoolInner {
+    pools: HashMap<PoolKey, BackendSet<PooledBackend>>,
+}
+
+fn stats_for_pools<'a, T>(pools: impl Iterator<Item = &'a BackendSet<T>>) -> PoolStats
+where
+    T: 'a,
+{
+    let mut stats = PoolStats::default();
+    for pool in pools {
+        stats.pools += 1;
+        stats.checked_out += pool.checked_out;
+        stats.idle += pool.idle.len();
+    }
+    stats.total = stats.checked_out + stats.idle;
+    stats
+}
+
+impl PoolInner {
+    fn try_reserve_new(
+        &mut self,
+        key: PoolKey,
+        max_backends_per_key: usize,
+    ) -> Result<(), CheckoutError> {
+        let pool = self.pools.entry(key).or_default();
+        if pool.checked_out + pool.idle.len() >= max_backends_per_key {
+            return Err(CheckoutError::PoolFull);
+        }
+
+        pool.checked_out += 1;
+        Ok(())
+    }
+
+    fn release_idle(&mut self, key: PoolKey, backend: PooledBackend) {
+        let pool = self.pools.entry(key).or_default();
+        pool.checked_out = pool.checked_out.saturating_sub(1);
+        pool.idle.push_back(backend);
+    }
+
+    fn release_checked_out(&mut self, key: &PoolKey) {
+        if let Some(pool) = self.pools.get_mut(key) {
+            pool.checked_out = pool.checked_out.saturating_sub(1);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -55,13 +141,11 @@ pub(crate) struct TransactionPool<T> {
 }
 
 #[derive(Debug)]
-#[cfg(test)]
 struct BackendSet<T> {
     idle: VecDeque<T>,
     checked_out: usize,
 }
 
-#[cfg(test)]
 impl<T> Default for BackendSet<T> {
     fn default() -> Self {
         Self {
@@ -105,11 +189,21 @@ impl<T> TransactionPool<T> {
         pool.idle.push_back(backend);
     }
 
+    pub(crate) fn release_checked_out(&mut self, key: &PoolKey) {
+        if let Some(pool) = self.pools.get_mut(key) {
+            pool.checked_out = pool.checked_out.saturating_sub(1);
+        }
+    }
+
     pub(crate) fn total_backends(&self) -> usize {
         self.pools
             .values()
             .map(|pool| pool.checked_out + pool.idle.len())
             .sum()
+    }
+
+    pub(crate) fn stats(&self) -> PoolStats {
+        stats_for_pools(self.pools.values())
     }
 }
 
@@ -167,5 +261,49 @@ mod tests {
 
         assert_eq!(second, "backend-b");
         assert_eq!(pool.total_backends(), 2);
+    }
+
+    #[test]
+    fn checked_out_backend_counts_against_pool_limit_until_released() {
+        let key = PoolKey::new("endpoint", "branch", "db", "role");
+        let mut pool = TransactionPool::new(1);
+
+        let first = pool
+            .checkout_or_insert(key.clone(), || "backend-1")
+            .unwrap();
+
+        assert_eq!(
+            pool.checkout_or_insert(key.clone(), || "backend-2"),
+            Err(CheckoutError::PoolFull)
+        );
+
+        pool.release_checked_out(&key);
+
+        let second = pool.checkout_or_insert(key, || "backend-2").unwrap();
+        assert_eq!(first, "backend-1");
+        assert_eq!(second, "backend-2");
+        assert_eq!(pool.total_backends(), 1);
+    }
+
+    #[test]
+    fn stats_report_active_idle_total_and_pool_count() {
+        let key_a = PoolKey::new("endpoint", "branch-a", "db", "role");
+        let key_b = PoolKey::new("endpoint", "branch-b", "db", "role");
+        let mut pool = TransactionPool::new(2);
+
+        let first = pool
+            .checkout_or_insert(key_a.clone(), || "backend-a")
+            .unwrap();
+        pool.release_idle(key_a.clone(), first);
+        let _second = pool
+            .checkout_or_insert(key_b, || "backend-b")
+            .unwrap();
+
+        let stats = pool.stats();
+
+        assert_eq!(stats.pools, 2);
+        assert_eq!(stats.idle, 1);
+        assert_eq!(stats.checked_out, 1);
+        assert_eq!(stats.total, 2);
     }
 }

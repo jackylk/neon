@@ -21,6 +21,7 @@ use crate::error::{ReportableError, UserFacingError};
 use crate::lakeon_pooler::pool::LakeonBackendPool;
 use crate::lakeon_pooler::session::LakeonPooledSession;
 use crate::lakeon_pooler::session::PooledBackend;
+use crate::lakeon_pooler::session::write_pooler_error_to_pq_stream;
 use crate::metrics::{Metrics, NumClientConnectionsGuard};
 pub use crate::pglb::copy_bidirectional::ErrorSource;
 use crate::pglb::handshake::{HandshakeData, HandshakeError, handshake};
@@ -56,6 +57,7 @@ pub async fn task_main(
     cancellation_handler: Arc<CancellationHandler>,
     endpoint_rate_limiter: Arc<EndpointRateLimiter>,
     lakeon_data_proxy: bool,
+    lakeon_pooler_max_backends_per_key: usize,
 ) -> anyhow::Result<()> {
     scopeguard::defer! {
         info!("proxy has shut down");
@@ -67,7 +69,7 @@ pub async fn task_main(
 
     let connections = tokio_util::task::task_tracker::TaskTracker::new();
     let cancellations = tokio_util::task::task_tracker::TaskTracker::new();
-    let lakeon_backend_pool = Arc::new(LakeonBackendPool::default());
+    let lakeon_backend_pool = Arc::new(LakeonBackendPool::new(lakeon_pooler_max_backends_per_key));
 
     while let Some(accept_result) =
         run_until_cancelled(listener.accept(), &cancellation_token).await
@@ -378,14 +380,51 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
         })));
     }
 
-    let connected = connect_authenticated_client(
+    let lakeon_new_backend_reserved =
+        if let (Some(pool_key), Some(pool)) = (&lakeon_pool_key, &lakeon_backend_pool) {
+            if pool.try_reserve_new(pool_key).await.is_err() {
+                let stats = pool.stats().await;
+                Metrics::get().proxy.lakeon_pooler_full_total.inc();
+                warn!(
+                    ?pool_key,
+                    pools = stats.pools,
+                    checked_out = stats.checked_out,
+                    idle = stats.idle,
+                    total = stats.total,
+                    "Lakeon pooled endpoint reached per-proxy backend limit"
+                );
+                send_client_greeting(ctx, &config.greetings, &mut client);
+                write_pooler_error_to_pq_stream(
+                    &mut client,
+                    "Lakeon pooled endpoint has reached the per-proxy backend connection limit; retry later or use the direct endpoint",
+                )
+                .await?;
+                return Ok(None);
+            }
+            true
+        } else {
+            false
+        };
+
+    let connected = match connect_authenticated_client(
         config,
         ctx,
         cancellation_handler,
         &mut client,
         authenticated,
     )
-    .await?;
+    .await
+    {
+        Ok(connected) => connected,
+        Err(e) => {
+            if lakeon_new_backend_reserved
+                && let (Some(pool_key), Some(pool)) = (&lakeon_pool_key, &lakeon_backend_pool)
+            {
+                pool.release_checked_out(pool_key).await;
+            }
+            return Err(e.into());
+        }
+    };
     let node = connected.node;
     let cancel_on_shutdown = connected.cancel_on_shutdown;
 
@@ -416,6 +455,11 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
             _conn: conn_gauge,
         })))
     } else {
+        if lakeon_new_backend_reserved
+            && let (Some(pool_key), Some(pool)) = (&lakeon_pool_key, &lakeon_backend_pool)
+        {
+            pool.release_checked_out(pool_key).await;
+        }
         Ok(Some(ProxyConnection::Direct(ProxyPassthrough {
             client,
             compute: node.stream.into_framed().into_inner(),
