@@ -246,6 +246,10 @@ struct ProxyCliArgs {
     #[clap(long, default_value_t = 20)]
     lakeon_pooler_max_backends_per_key: usize,
 
+    /// Maximum time a Lakeon pooled connection waits for a reusable backend when the pool is full.
+    #[clap(long, default_value = "5s", value_parser = humantime::parse_duration)]
+    lakeon_pooler_queue_timeout: std::time::Duration,
+
     /// Configure whether all incoming requests have a Proxy Protocol V2 packet.
     #[clap(value_enum, long, default_value_t = ProxyProtocolV2::Rejected)]
     proxy_protocol_v2: ProxyProtocolV2,
@@ -458,6 +462,7 @@ pub async fn run() -> anyhow::Result<()> {
                     endpoint_rate_limiter.clone(),
                     args.lakeon_data_proxy,
                     args.lakeon_pooler_max_backends_per_key,
+                    args.lakeon_pooler_queue_timeout,
                 ));
             }
 
@@ -1027,11 +1032,20 @@ mod tests {
 
     #[test]
     fn parse_lakeon_pooler_max_backends_per_key() {
-        let config = super::ProxyCliArgs::parse_from([
-            "proxy",
-            "--lakeon-pooler-max-backends-per-key=7",
-        ]);
+        let config =
+            super::ProxyCliArgs::parse_from(["proxy", "--lakeon-pooler-max-backends-per-key=7"]);
 
         assert_eq!(config.lakeon_pooler_max_backends_per_key, 7);
+    }
+
+    #[test]
+    fn parse_lakeon_pooler_queue_timeout() {
+        let config =
+            super::ProxyCliArgs::parse_from(["proxy", "--lakeon-pooler-queue-timeout=750ms"]);
+
+        assert_eq!(
+            config.lakeon_pooler_queue_timeout,
+            Duration::from_millis(750)
+        );
     }
 }

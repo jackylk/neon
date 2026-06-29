@@ -96,6 +96,9 @@ pub struct ProxyMetrics {
     /// Number of Lakeon pooled TCP connections rejected because the per-proxy pool is full.
     pub lakeon_pooler_full_total: Counter,
 
+    /// Number of Lakeon pooled TCP connections rejected after waiting for a backend too long.
+    pub lakeon_pooler_queue_timeout_total: Counter,
+
     /// Number of allowed ips
     #[metric(metadata = Thresholds::with_buckets([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 10.0, 20.0, 50.0, 100.0]))]
     pub allowed_ips_number: Histogram<10>,

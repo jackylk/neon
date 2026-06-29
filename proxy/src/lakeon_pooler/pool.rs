@@ -1,7 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
+use tokio::time;
 
 use super::session::PooledBackend;
 
@@ -27,17 +29,30 @@ impl LakeonBackendPool {
         }
     }
 
-    pub(crate) async fn checkout_idle(&self, key: &PoolKey) -> Option<PooledBackend> {
-        let mut inner = self.inner.lock().await;
-        let pool = inner.pools.get_mut(key)?;
-        let backend = pool.idle.pop_front()?;
-        pool.checked_out += 1;
-        Some(backend)
-    }
+    pub(crate) async fn checkout_or_reserve(
+        &self,
+        key: &PoolKey,
+        queue_timeout: Duration,
+    ) -> Result<Checkout<PooledBackend>, CheckoutError> {
+        loop {
+            let notify = {
+                let mut inner = self.inner.lock().await;
+                match inner.checkout_or_reserve(key.clone(), self.max_backends_per_key) {
+                    Ok(checkout) => return Ok(checkout),
+                    Err(CheckoutError::PoolFull) => inner.notify_for(key),
+                    Err(CheckoutError::QueueTimeout) => {
+                        unreachable!("queue timeout is not emitted while holding the pool lock")
+                    }
+                }
+            };
 
-    pub(crate) async fn try_reserve_new(&self, key: &PoolKey) -> Result<(), CheckoutError> {
-        let mut inner = self.inner.lock().await;
-        inner.try_reserve_new(key.clone(), self.max_backends_per_key)
+            if time::timeout(queue_timeout, notify.notified())
+                .await
+                .is_err()
+            {
+                return Err(CheckoutError::QueueTimeout);
+            }
+        }
     }
 
     pub(crate) async fn release_idle(&self, key: PoolKey, backend: PooledBackend) {
@@ -76,6 +91,13 @@ impl PoolKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CheckoutError {
     PoolFull,
+    QueueTimeout,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Checkout<T> {
+    Idle(T),
+    ReservedNew,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -106,29 +128,40 @@ where
 }
 
 impl PoolInner {
-    fn try_reserve_new(
+    fn checkout_or_reserve(
         &mut self,
         key: PoolKey,
         max_backends_per_key: usize,
-    ) -> Result<(), CheckoutError> {
+    ) -> Result<Checkout<PooledBackend>, CheckoutError> {
         let pool = self.pools.entry(key).or_default();
+        if let Some(backend) = pool.idle.pop_front() {
+            pool.checked_out += 1;
+            return Ok(Checkout::Idle(backend));
+        }
+
         if pool.checked_out + pool.idle.len() >= max_backends_per_key {
             return Err(CheckoutError::PoolFull);
         }
 
         pool.checked_out += 1;
-        Ok(())
+        Ok(Checkout::ReservedNew)
+    }
+
+    fn notify_for(&mut self, key: &PoolKey) -> Arc<Notify> {
+        self.pools.entry(key.clone()).or_default().notify.clone()
     }
 
     fn release_idle(&mut self, key: PoolKey, backend: PooledBackend) {
         let pool = self.pools.entry(key).or_default();
         pool.checked_out = pool.checked_out.saturating_sub(1);
         pool.idle.push_back(backend);
+        pool.notify.notify_one();
     }
 
     fn release_checked_out(&mut self, key: &PoolKey) {
         if let Some(pool) = self.pools.get_mut(key) {
             pool.checked_out = pool.checked_out.saturating_sub(1);
+            pool.notify.notify_one();
         }
     }
 }
@@ -144,6 +177,7 @@ pub(crate) struct TransactionPool<T> {
 struct BackendSet<T> {
     idle: VecDeque<T>,
     checked_out: usize,
+    notify: Arc<Notify>,
 }
 
 impl<T> Default for BackendSet<T> {
@@ -151,6 +185,7 @@ impl<T> Default for BackendSet<T> {
         Self {
             idle: VecDeque::new(),
             checked_out: 0,
+            notify: Arc::new(Notify::new()),
         }
     }
 }
@@ -183,6 +218,24 @@ impl<T> TransactionPool<T> {
         Ok(create())
     }
 
+    pub(crate) fn checkout_or_reserve(
+        &mut self,
+        key: PoolKey,
+    ) -> Result<Checkout<T>, CheckoutError> {
+        let pool = self.pools.entry(key).or_default();
+        if let Some(backend) = pool.idle.pop_front() {
+            pool.checked_out += 1;
+            return Ok(Checkout::Idle(backend));
+        }
+
+        if pool.checked_out + pool.idle.len() >= self.max_backends_per_key {
+            return Err(CheckoutError::PoolFull);
+        }
+
+        pool.checked_out += 1;
+        Ok(Checkout::ReservedNew)
+    }
+
     pub(crate) fn release_idle(&mut self, key: PoolKey, backend: T) {
         let pool = self.pools.entry(key).or_default();
         pool.checked_out = pool.checked_out.saturating_sub(1);
@@ -209,7 +262,9 @@ impl<T> TransactionPool<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CheckoutError, PoolKey, TransactionPool};
+    use std::time::Duration;
+
+    use super::{Checkout, CheckoutError, LakeonBackendPool, PoolKey, TransactionPool};
 
     #[test]
     fn checkout_reuses_idle_backend_for_same_key() {
@@ -230,7 +285,7 @@ mod tests {
     #[test]
     fn checkout_rejects_when_pool_is_full_for_key() {
         let key = PoolKey::new("endpoint", "branch", "db", "role");
-        let mut pool = TransactionPool::new(1);
+        let mut pool: TransactionPool<&str> = TransactionPool::new(1);
 
         let _first = pool
             .checkout_or_insert(key.clone(), || "backend-1")
@@ -240,6 +295,66 @@ mod tests {
             pool.checkout_or_insert(key, || "backend-2"),
             Err(CheckoutError::PoolFull)
         );
+    }
+
+    #[test]
+    fn checkout_waits_when_pool_is_full_then_reserves_after_release() {
+        let key = PoolKey::new("endpoint", "branch", "db", "role");
+        let mut pool: TransactionPool<&str> = TransactionPool::new(1);
+
+        let first = pool.checkout_or_reserve(key.clone()).unwrap();
+        assert_eq!(first, Checkout::ReservedNew);
+
+        assert_eq!(
+            pool.checkout_or_reserve(key.clone()),
+            Err(CheckoutError::PoolFull)
+        );
+
+        pool.release_checked_out(&key);
+
+        let second = pool.checkout_or_reserve(key).unwrap();
+        assert_eq!(second, Checkout::ReservedNew);
+    }
+
+    #[tokio::test]
+    async fn backend_pool_waiter_reserves_after_checked_out_backend_is_released() {
+        let key = PoolKey::new("endpoint", "branch", "db", "role");
+        let pool = LakeonBackendPool::new(1);
+
+        assert!(matches!(
+            pool.checkout_or_reserve(&key, Duration::from_secs(1))
+                .await
+                .unwrap(),
+            Checkout::ReservedNew
+        ));
+
+        let waiting_pool = pool.clone();
+        let waiting_key = key.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_pool
+                .checkout_or_reserve(&waiting_key, Duration::from_secs(1))
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        pool.release_checked_out(&key).await;
+
+        assert!(matches!(
+            waiter.await.unwrap().unwrap(),
+            Checkout::ReservedNew
+        ));
+    }
+
+    #[tokio::test]
+    async fn backend_pool_waiter_times_out_when_no_backend_is_released() {
+        let key = PoolKey::new("endpoint", "branch", "db", "role");
+        let pool = LakeonBackendPool::new(0);
+
+        assert!(matches!(
+            pool.checkout_or_reserve(&key, Duration::from_millis(10))
+                .await,
+            Err(CheckoutError::QueueTimeout)
+        ));
     }
 
     #[test]
@@ -295,9 +410,7 @@ mod tests {
             .checkout_or_insert(key_a.clone(), || "backend-a")
             .unwrap();
         pool.release_idle(key_a.clone(), first);
-        let _second = pool
-            .checkout_or_insert(key_b, || "backend-b")
-            .unwrap();
+        let _second = pool.checkout_or_insert(key_b, || "backend-b").unwrap();
 
         let stats = pool.stats();
 

@@ -155,6 +155,7 @@ pub(crate) async fn serve_websocket(
         cancellations,
         false,
         None,
+        std::time::Duration::ZERO,
     ))
     .await;
 
