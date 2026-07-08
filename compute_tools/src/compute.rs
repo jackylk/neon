@@ -634,7 +634,9 @@ impl ComputeNode {
         // because QEMU will already have its memory allocated from the host, and
         // the necessary binaries will already be cached.
         if cli_spec.is_none() {
-            this.prewarm_postgres_vm_memory()?;
+            if let Err(err) = this.prewarm_postgres_vm_memory() {
+                warn!("prewarming VM memory failed, continuing in Empty state: {err:#}");
+            }
         }
 
         // Set the up metric with Empty status before starting the HTTP server.

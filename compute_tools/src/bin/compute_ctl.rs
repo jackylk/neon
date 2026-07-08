@@ -44,7 +44,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use compute_api::responses::ComputeConfig;
+use compute_api::responses::{ComputeConfig, ComputeCtlConfig};
 use compute_tools::compute::{
     BUILD_TAG, ComputeNode, ComputeNodeParams, forward_termination_signal,
 };
@@ -314,6 +314,14 @@ fn get_config(cli: &Cli) -> Result<ComputeConfig> {
     if let Some(ref config) = cli.config {
         let file = File::open(config)?;
         return Ok(serde_json::from_reader(&file)?);
+    }
+
+    if cli.control_plane_uri.is_none() {
+        info!("neither --config nor --control-plane-uri provided; starting in Empty state");
+        return Ok(ComputeConfig {
+            spec: None,
+            compute_ctl_config: ComputeCtlConfig::default(),
+        });
     }
 
     // If the config wasn't provided in the CLI arguments, then retrieve it from
