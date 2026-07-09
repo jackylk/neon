@@ -1146,7 +1146,7 @@ USER root
 #########################################################################################
 #
 # Layer "rust-extensions-build-pgrx16"
-# Build environment for pgrx 0.16.x extensions (e.g., pg_search)
+# Build environment for pgrx 0.16.x extensions
 #
 #########################################################################################
 FROM pg-build-with-cargo AS rust-extensions-build-pgrx16
@@ -1159,29 +1159,32 @@ USER root
 
 #########################################################################################
 #
-# Layer "pg_search-build"
-# Compile ParadeDB pg_search (BM25 full-text search)
+# Layer "pg_textsearch-build"
+# Compile pg_textsearch (BM25 full-text search, PostgreSQL license)
 #
 #########################################################################################
-FROM build-deps AS pg_search-src
+FROM build-deps AS pg_textsearch-src
 ARG PG_VERSION
 WORKDIR /ext-src
-RUN wget https://github.com/paradedb/paradedb/archive/refs/tags/v0.21.15.tar.gz -O pg_search.tar.gz && \
-    mkdir pg_search-src && cd pg_search-src && tar xzf ../pg_search.tar.gz --strip-components=1 -C .
+RUN wget https://github.com/timescale/pg_textsearch/archive/refs/tags/v1.3.1.tar.gz -O pg_textsearch.tar.gz && \
+    echo "2ef1f8ea3d9bdef638e64cd844d37790ad27dc53e6bebdb2ad36e549fc5e671f pg_textsearch.tar.gz" | sha256sum --check && \
+    mkdir pg_textsearch-src && cd pg_textsearch-src && tar xzf ../pg_textsearch.tar.gz --strip-components=1 -C .
 
-FROM rust-extensions-build-pgrx16 AS pg_search-build
-COPY --from=pg_search-src /ext-src/ /ext-src/
-COPY compute/patches/pg_search.patch /ext-src/pg_search-src/
-WORKDIR /ext-src/pg_search-src
-RUN patch -p1 < pg_search.patch
-WORKDIR /ext-src/pg_search-src/pg_search
-RUN \
-    # Enable unsafe-postgres feature for Neon ABI compatibility
-    sed -i 's/pgrx = "=0.16.1"/pgrx = { version = "=0.16.1", features = ["unsafe-postgres"] }/g' Cargo.toml && \
-    sed -i 's/pgrx.workspace = true/pgrx = { version = "=0.16.1", features = ["unsafe-postgres"] }/g' Cargo.toml && \
-    sed -i 's/pgrx-tests.workspace = true/pgrx-tests = "=0.16.1"/g' Cargo.toml && \
-    cargo pgrx install --release --features neon && \
-    echo "trusted = true" >> /usr/local/pgsql/share/extension/pg_search.control
+FROM pg-build AS pg_textsearch-build
+ARG PG_VERSION
+COPY --from=pg_textsearch-src /ext-src/ /ext-src/
+WORKDIR /ext-src/pg_textsearch-src
+RUN case "${PG_VERSION:?}" in \
+        "v17") \
+            make -j $(getconf _NPROCESSORS_ONLN) PG_CONFIG=/usr/local/pgsql/bin/pg_config && \
+            make -j $(getconf _NPROCESSORS_ONLN) PG_CONFIG=/usr/local/pgsql/bin/pg_config install && \
+            echo 'trusted = true' >> /usr/local/pgsql/share/extension/pg_textsearch.control; \
+            ;; \
+        *) \
+            echo "pg_textsearch supports PostgreSQL 17+; skipping for ${PG_VERSION}" && \
+            rm -rf /usr/local/pgsql && mkdir -p /usr/local/pgsql; \
+            ;; \
+    esac
 
 #########################################################################################
 #
@@ -1701,6 +1704,7 @@ COPY --from=pgrag-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=timescaledb-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_cron-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_partman-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=pg_textsearch-build /usr/local/pgsql/ /usr/local/pgsql/
 
 #########################################################################################
 #
@@ -1752,7 +1756,7 @@ COPY --from=pg_duckdb-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_repack-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pgaudit-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pgauditlogtofile-build /usr/local/pgsql/ /usr/local/pgsql/
-COPY --from=pg_search-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=pg_textsearch-build /usr/local/pgsql/ /usr/local/pgsql/
 
 #########################################################################################
 #
