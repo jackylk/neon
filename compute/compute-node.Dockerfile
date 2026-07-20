@@ -222,145 +222,6 @@ ENV PATH="/usr/local/pgsql/bin:$PATH"
 
 #########################################################################################
 #
-# Layer "postgis-build"
-# Build PostGIS from the upstream PostGIS mirror.
-#
-#########################################################################################
-FROM build-deps AS postgis-src
-ARG DEBIAN_VERSION
-ARG PG_VERSION
-
-# Postgis 3.5.0 requires SFCGAL 1.4+
-#
-# It would be nice to update all versions together, but we must solve the SFCGAL dependency first.
-# SFCGAL > 1.3 requires CGAL > 5.2, Bullseye's libcgal-dev is 5.2
-# and also we must check backward compatibility with older versions of PostGIS.
-#
-# Use new version only for v17
-WORKDIR /ext-src
-RUN case "${DEBIAN_VERSION}" in \
-    "bookworm") \
-        export SFCGAL_VERSION=1.4.1 \
-        export SFCGAL_CHECKSUM=1800c8a26241588f11cddcf433049e9b9aea902e923414d2ecef33a3295626c3 \
-    ;; \
-    "bullseye") \
-        export SFCGAL_VERSION=1.3.10 \
-        export SFCGAL_CHECKSUM=4e39b3b2adada6254a7bdba6d297bb28e1a9835a9f879b74f37e2dab70203232 \
-    ;; \
-    *) \
-        echo "unexpected PostgreSQL version" && exit 1 \
-    ;; \
-    esac && \
-    wget https://gitlab.com/sfcgal/SFCGAL/-/archive/v${SFCGAL_VERSION}/SFCGAL-v${SFCGAL_VERSION}.tar.gz -O SFCGAL.tar.gz && \
-    echo "${SFCGAL_CHECKSUM} SFCGAL.tar.gz" | sha256sum --check && \
-    mkdir sfcgal-src && cd sfcgal-src && tar xzf ../SFCGAL.tar.gz --strip-components=1 -C .
-
-# Postgis 3.5.0 supports v17
-WORKDIR /ext-src
-RUN case "${PG_VERSION:?}" in \
-    "v17") \
-        export POSTGIS_VERSION=3.5.0 \
-        export POSTGIS_CHECKSUM=ca698a22cc2b2b3467ac4e063b43a28413f3004ddd505bdccdd74c56a647f510 \
-    ;; \
-    "v14" | "v15" | "v16") \
-        export POSTGIS_VERSION=3.3.3 \
-        export POSTGIS_CHECKSUM=74eb356e3f85f14233791013360881b6748f78081cc688ff9d6f0f673a762d13 \
-    ;; \
-    *) \
-        echo "unexpected PostgreSQL version" && exit 1 \
-    ;; \
-    esac && \
-    wget https://download.osgeo.org/postgis/source/postgis-${POSTGIS_VERSION}.tar.gz -O postgis.tar.gz && \
-    echo "${POSTGIS_CHECKSUM} postgis.tar.gz" | sha256sum --check && \
-    mkdir postgis-src && cd postgis-src && tar xzf ../postgis.tar.gz --strip-components=1 -C .
-
-# This is reused for pgrouting
-FROM pg-build AS postgis-build-deps
-RUN apt update && \
-    apt install --no-install-recommends --no-install-suggests -y \
-    gdal-bin libboost-dev libboost-thread-dev libboost-filesystem-dev \
-    libboost-system-dev libboost-iostreams-dev libboost-program-options-dev libboost-timer-dev \
-    libcgal-dev libgdal-dev libgmp-dev libmpfr-dev libopenscenegraph-dev libprotobuf-c-dev \
-    protobuf-c-compiler xsltproc \
-    && apt clean && rm -rf /var/lib/apt/lists/*
-
-FROM postgis-build-deps AS postgis-build
-COPY --from=postgis-src /ext-src/ /ext-src/
-WORKDIR /ext-src/sfcgal-src
-RUN cmake -DCMAKE_BUILD_TYPE=Release -GNinja . && ninja -j $(getconf _NPROCESSORS_ONLN) && \
-    DESTDIR=/sfcgal ninja install -j $(getconf _NPROCESSORS_ONLN) && \
-    ninja clean && cp -R /sfcgal/* /
-
-WORKDIR /ext-src/postgis-src
-RUN ./autogen.sh && \
-    ./configure --with-sfcgal=/usr/local/bin/sfcgal-config && \
-    make -j $(getconf _NPROCESSORS_ONLN) && \
-    make -j $(getconf _NPROCESSORS_ONLN) install && \
-    make staged-install && \
-    cd extensions/postgis && \
-    make clean && \
-    make -j $(getconf _NPROCESSORS_ONLN) install && \
-    echo 'trusted = true' >> /usr/local/pgsql/share/extension/postgis.control && \
-    echo 'trusted = true' >> /usr/local/pgsql/share/extension/postgis_raster.control && \
-    echo 'trusted = true' >> /usr/local/pgsql/share/extension/postgis_sfcgal.control && \
-    echo 'trusted = true' >> /usr/local/pgsql/share/extension/postgis_tiger_geocoder.control && \
-    echo 'trusted = true' >> /usr/local/pgsql/share/extension/postgis_topology.control && \
-    echo 'trusted = true' >> /usr/local/pgsql/share/extension/address_standardizer.control && \
-    echo 'trusted = true' >> /usr/local/pgsql/share/extension/address_standardizer_data_us.control && \
-    mkdir -p /extensions/postgis && \
-    cp /usr/local/pgsql/share/extension/postgis.control /extensions/postgis && \
-    cp /usr/local/pgsql/share/extension/postgis_raster.control /extensions/postgis && \
-    cp /usr/local/pgsql/share/extension/postgis_sfcgal.control /extensions/postgis && \
-    cp /usr/local/pgsql/share/extension/postgis_tiger_geocoder.control /extensions/postgis && \
-    cp /usr/local/pgsql/share/extension/postgis_topology.control /extensions/postgis && \
-    cp /usr/local/pgsql/share/extension/address_standardizer.control /extensions/postgis && \
-    cp /usr/local/pgsql/share/extension/address_standardizer_data_us.control /extensions/postgis
-
-#########################################################################################
-#
-# Layer "pgrouting-build"
-# Build pgrouting. Note: This depends on the postgis-build-deps layer built above
-#
-#########################################################################################
-
-# Uses versioned libraries, i.e. libpgrouting-3.4
-# and may introduce function signature changes between releases
-# i.e. release 3.5.0 has new signature for pg_dijkstra function
-#
-# Use new version only for v17
-# last release v3.6.2 - Mar 30, 2024
-FROM build-deps AS pgrouting-src
-ARG DEBIAN_VERSION
-ARG PG_VERSION
-WORKDIR /ext-src
-RUN case "${PG_VERSION:?}" in \
-    "v17") \
-        export PGROUTING_VERSION=3.6.2 \
-        export PGROUTING_CHECKSUM=f4a1ed79d6f714e52548eca3bb8e5593c6745f1bde92eb5fb858efd8984dffa2 \
-    ;; \
-    "v14" | "v15" | "v16") \
-        export PGROUTING_VERSION=3.4.2 \
-        export PGROUTING_CHECKSUM=cac297c07d34460887c4f3b522b35c470138760fe358e351ad1db4edb6ee306e \
-    ;; \
-    *) \
-        echo "unexpected PostgreSQL version" && exit 1 \
-    ;; \
-    esac && \
-    wget https://github.com/pgRouting/pgrouting/archive/v${PGROUTING_VERSION}.tar.gz -O pgrouting.tar.gz && \
-    echo "${PGROUTING_CHECKSUM} pgrouting.tar.gz" | sha256sum --check && \
-    mkdir pgrouting-src && cd pgrouting-src && tar xzf ../pgrouting.tar.gz --strip-components=1 -C .
-
-FROM postgis-build-deps AS pgrouting-build
-COPY --from=pgrouting-src /ext-src/ /ext-src/
-WORKDIR /ext-src/pgrouting-src
-RUN mkdir build && cd build && \
-    cmake -GNinja -DCMAKE_BUILD_TYPE=Release .. && \
-    ninja -j $(getconf _NPROCESSORS_ONLN) && \
-    ninja -j $(getconf _NPROCESSORS_ONLN) install && \
-    echo 'trusted = true' >> /usr/local/pgsql/share/extension/pgrouting.control
-
-#########################################################################################
-#
 # Layer "plv8-build"
 # Build plv8
 #
@@ -475,7 +336,7 @@ RUN ls -l && \
     make -j $(getconf _NPROCESSORS_ONLN) && \
     make -j $(getconf _NPROCESSORS_ONLN) install && \
     echo 'trusted = true' >> /usr/local/pgsql/share/extension/h3.control && \
-    echo 'trusted = true' >> /usr/local/pgsql/share/extension/h3_postgis.control
+    rm -f /usr/local/pgsql/share/extension/h3_postgis*
 
 #########################################################################################
 #
@@ -1715,9 +1576,6 @@ COPY --from=pg_textsearch-build /usr/local/pgsql/ /usr/local/pgsql/
 FROM build-deps AS extensions-all
 
 # Public extensions
-COPY --from=postgis-build /usr/local/pgsql/ /usr/local/pgsql/
-COPY --from=postgis-build /sfcgal/* /
-COPY --from=pgrouting-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=plv8-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=h3-pg-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=h3-pg-build /h3/usr /
@@ -1893,25 +1751,10 @@ RUN make PG_VERSION="${PG_VERSION:?}" -C compute
 
 FROM pg-build AS extension-tests
 ARG PG_VERSION
-# This is required for the PostGIS test
-RUN apt-get update && case $DEBIAN_VERSION in \
-      bullseye) \
-        apt-get install -y libproj19 libgdal28 time; \
-      ;; \
-      bookworm) \
-        apt-get install -y libgdal32 libproj25 time; \
-      ;; \
-      *) \
-        echo "Unknown Debian version ${DEBIAN_VERSION}" && exit 1 \
-      ;; \
-    esac
 
 COPY docker-compose/ext-src/ /ext-src/
 
 COPY --from=pg-build /postgres /postgres
-COPY --from=postgis-build /usr/local/pgsql/ /usr/local/pgsql/
-COPY --from=postgis-build /ext-src/postgis-src /ext-src/postgis-src
-COPY --from=postgis-build /sfcgal/* /usr
 COPY --from=plv8-src /ext-src/ /ext-src/
 COPY --from=h3-pg-src /ext-src/h3-pg-src /ext-src/h3-pg-src
 COPY --from=postgresql-unit-src /ext-src/ /ext-src/
@@ -1978,7 +1821,6 @@ SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 # libreadline8 for psql
 # liblz4-1 for lz4
 # libossp-uuid16 for extension ossp-uuid
-# libgeos, libsfcgal1, and libprotobuf-c1 for PostGIS
 # libxml2, libxslt1.1 for xml2
 # libzstd1 for zstd
 # libboost* for rdkit
@@ -1990,15 +1832,13 @@ RUN apt update && \
     case $DEBIAN_VERSION in \
       # Version-specific installs for Bullseye (PG14-PG16):
       # libicu67, locales for collations (including ICU and plpgsql_check)
-      # libgdal28, libproj19 for PostGIS
       bullseye) \
-        VERSION_INSTALLS="libicu67 libgdal28 libproj19"; \
+        VERSION_INSTALLS="libicu67"; \
       ;; \
       # Version-specific installs for Bookworm (PG17):
       # libicu72, locales for collations (including ICU and plpgsql_check)
-      # libgdal32, libproj25 for PostGIS
       bookworm) \
-        VERSION_INSTALLS="libicu72 libgdal32 libproj25"; \
+        VERSION_INSTALLS="libicu72"; \
       ;; \
       *) \
         echo "Unknown Debian version ${DEBIAN_VERSION}" && exit 1 \
@@ -2014,12 +1854,9 @@ RUN apt update && \
         libboost-system1.74.0 \
         libcurl4 \
         libevent-2.1-7 \
-        libgeos-c1v5 \
         liblz4-1 \
         libossp-uuid16 \
-        libprotobuf-c1 \
         libreadline8 \
-        libsfcgal1 \
         libxml2 \
         libxslt1.1 \
         libzstd1 \
