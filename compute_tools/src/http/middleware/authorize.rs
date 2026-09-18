@@ -39,6 +39,21 @@ impl Authorize {
         }
         // END HADRON
 
+        // BEGIN DBAY
+        // Lakeon signs compute JWTs with PS256 (RSA-PSS/SHA-256) and advertises
+        // alg=PS256 in the JWKS; RS256 is not issued or accepted there. Without
+        // this branch the validation stayed EdDSA and every warm-pool reconfigure
+        // failed with InvalidAlgorithm (2026-09-18).
+        let use_rsa_pss = jwks.keys.iter().any(|jwk| {
+            jwk.common
+                .key_algorithm
+                .is_some_and(|alg| alg == jsonwebtoken::jwk::KeyAlgorithm::PS256)
+        });
+        if use_rsa_pss {
+            validation = Validation::new(Algorithm::PS256);
+        }
+        // END DBAY
+
         validation.validate_exp = true;
         // Unused by the control plane
         validation.validate_nbf = false;
