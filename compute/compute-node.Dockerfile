@@ -930,7 +930,7 @@ WORKDIR /home/nonroot
 # See comment on the top of the file regading `echo` and `\n`
 RUN echo -e "--retry-connrefused\n--connect-timeout 15\n--retry 5\n--max-time 300\n" > /home/nonroot/.curlrc
 
-RUN curl -sSO https://static.rust-lang.org/rustup/dist/$(uname -m)-unknown-linux-gnu/rustup-init && \
+RUN curl --http1.1 --retry-all-errors -sSO https://static.rust-lang.org/rustup/dist/$(uname -m)-unknown-linux-gnu/rustup-init && \
     chmod +x rustup-init && \
     ./rustup-init -y --no-modify-path --profile minimal --default-toolchain stable && \
     rm rustup-init
