@@ -1773,6 +1773,21 @@ RUN --mount=type=cache,uid=1000,target=/home/nonroot/.cargo/registry \
        target/release-line-debug-size-lto/local_proxy \
        target-bin
 
+# Build only compute_ctl for Lakebase compute overlays. This avoids linking
+# unrelated tools and stays within local and CI builder memory limits.
+FROM build-deps-with-cargo AS compute-ctl
+ARG BUILD_TAG
+ENV BUILD_TAG=$BUILD_TAG
+
+USER nonroot
+COPY --chown=nonroot . .
+RUN --mount=type=cache,uid=1000,target=/home/nonroot/.cargo/registry \
+    --mount=type=cache,uid=1000,target=/home/nonroot/.cargo/git \
+    --mount=type=cache,uid=1000,target=/home/nonroot/target \
+    CARGO_BUILD_JOBS=1 cargo build --locked --profile release-line-debug-size-lto --bin compute_ctl && \
+    mkdir target-bin && \
+    cp target/release-line-debug-size-lto/compute_ctl target-bin
+
 #########################################################################################
 #
 # Layer "pgbouncer"
