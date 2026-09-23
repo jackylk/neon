@@ -315,6 +315,7 @@ mod tests {
     #[test]
     fn source_identity_and_object_key_are_stable() {
         let source = deterministic_source_id("tenant-a", "folder_rf_a");
+        assert_eq!(source.to_string(), "c3e9b970-29df-506e-ab86-6f7007629879");
         assert_eq!(source, deterministic_source_id("tenant-a", "folder_rf_a"));
         assert_ne!(source, deterministic_source_id("tenant-a", "folder_rf_b"));
         let config = Config {
