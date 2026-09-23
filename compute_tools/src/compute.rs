@@ -681,6 +681,7 @@ impl ComputeNode {
 
         match this.start_compute(&mut pg_process) {
             Ok(()) => {
+                crate::index_exporter::launch_if_configured(this.clone());
                 // Success! Launch remaining services (just vm-monitor currently)
                 vm_monitor =
                     Some(this.start_vm_monitor(pspec.spec.disable_lfc_resizing.unwrap_or(false)));
