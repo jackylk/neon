@@ -3,6 +3,7 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::{Builder as S3ConfigBuilder, Region};
 use aws_smithy_types::byte_stream::ByteStream;
 use base64::Engine;
+use chrono::SecondsFormat;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -173,7 +174,7 @@ async fn publish(
     metadata.insert("x-index-payload-sha256".into(), checksum.clone());
     let encoded_revision = segment(intent.state_hash.clone());
     metadata.insert("x-index-source-revision".into(), encoded_revision.clone());
-    metadata.insert("x-index-created-at".into(), chrono::Utc::now().to_rfc3339());
+    metadata.insert("x-index-created-at".into(), created_at());
     let response = s3
         .put_object()
         .bucket(&config.bucket)
@@ -207,6 +208,10 @@ async fn publish(
         bail!("OBS immutable object verification failed");
     }
     Ok((key, version, checksum))
+}
+
+fn created_at() -> String {
+    chrono::Utc::now().to_rfc3339_opts(SecondsFormat::AutoSi, true)
 }
 
 fn object_key(config: &Config, intent: &Intent, source_id: Uuid) -> String {
@@ -312,6 +317,13 @@ fn required(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn created_at_uses_utc_z_suffix_required_by_index_contract() {
+        let value = created_at();
+        assert!(value.ends_with('Z'), "unexpected created-at: {value}");
+        assert!(chrono::DateTime::parse_from_rfc3339(&value).is_ok());
+    }
+
     #[test]
     fn source_identity_and_object_key_are_stable() {
         let source = deterministic_source_id("tenant-a", "folder_rf_a");
