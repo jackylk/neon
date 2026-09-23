@@ -40,6 +40,12 @@ pub struct ComputeSpec {
     // deserializing it.
     pub operation_uuid: Option<String>,
 
+    /// Lakeon-owned metadata for the in-process LakebaseFS index exporter.
+    /// Kept in the reconfigurable spec so warm-pool computes always use the
+    /// identity of their current assignment rather than immutable Pod env.
+    #[serde(default)]
+    pub lakeon_index_export: Option<LakeonIndexExportSpec>,
+
     /// Compute features to enable. These feature flags are provided, when we
     /// know all the details about client's compute, so they cannot be used
     /// to change `Empty` compute behavior.
@@ -212,6 +218,13 @@ pub struct ComputeSpec {
 
     // Databricks specific options for compute instance.
     pub databricks_settings: Option<DatabricksSettings>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LakeonIndexExportSpec {
+    pub tenant_id: String,
+    pub namespace_id: String,
+    pub source_generation: u64,
 }
 
 /// Feature flag to signal `compute_ctl` to enable certain experimental functionality.
