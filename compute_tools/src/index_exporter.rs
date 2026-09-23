@@ -171,7 +171,8 @@ async fn publish(
     metadata.insert("x-index-input-kind".into(), "raw_file".into());
     metadata.insert("x-index-media-type".into(), intent.media_type.clone());
     metadata.insert("x-index-payload-sha256".into(), checksum.clone());
-    metadata.insert("x-index-source-revision".into(), intent.state_hash.clone());
+    let encoded_revision = segment(intent.state_hash.clone());
+    metadata.insert("x-index-source-revision".into(), encoded_revision.clone());
     metadata.insert("x-index-created-at".into(), chrono::Utc::now().to_rfc3339());
     let response = s3
         .put_object()
@@ -201,7 +202,7 @@ async fn publish(
         || head
             .metadata()
             .and_then(|value| value.get("x-index-source-revision"))
-            != Some(&intent.state_hash)
+            != Some(&encoded_revision)
     {
         bail!("OBS immutable object verification failed");
     }
@@ -335,5 +336,16 @@ mod tests {
         };
         assert!(object_key(&config, &intent, source).starts_with("index/v1/inputs/"));
         assert_eq!(object_key(&config, &intent, source).split('/').count(), 13);
+        let encoded_revision = segment(intent.state_hash.clone());
+        assert_ne!(encoded_revision, intent.state_hash);
+        assert_eq!(
+            String::from_utf8(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(encoded_revision)
+                    .unwrap()
+            )
+            .unwrap(),
+            intent.state_hash
+        );
     }
 }
