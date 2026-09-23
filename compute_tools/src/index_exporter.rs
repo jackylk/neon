@@ -136,6 +136,11 @@ async fn discover_schemas(client: &tokio_postgres::Client) -> Result<Vec<String>
 
 async fn claim(client: &mut tokio_postgres::Client, schema: &str) -> Result<Option<Intent>> {
     let transaction = client.transaction().await?;
+    let supersede_sql = format!(
+        "UPDATE {s}.index_export_outbox o SET status='dead',lease_owner=NULL,lease_expires_at=NULL,last_error='superseded by a newer file revision',updated_at=now() WHERE o.status IN ('pending','uploading') AND NOT EXISTS (SELECT 1 FROM {s}.entries e JOIN {s}.file_contents f ON f.entry_id=e.entry_id WHERE e.entry_id=o.entry_id AND e.state_hash=o.source_state_hash)",
+        s = quote(schema)
+    );
+    transaction.execute(&supersede_sql, &[]).await?;
     let sql = format!(
         "WITH candidate AS (SELECT entry_id,source_state_hash,submission_id,media_type FROM {s}.index_export_outbox WHERE status IN ('pending','uploading') AND available_at<=now() AND (lease_expires_at IS NULL OR lease_expires_at<=now()) ORDER BY available_at,entry_id FOR UPDATE SKIP LOCKED LIMIT 1), claimed AS (UPDATE {s}.index_export_outbox o SET status='uploading',attempts=attempts+1,lease_owner=$1,lease_expires_at=now()+interval '2 minutes',updated_at=now() FROM candidate c WHERE o.entry_id=c.entry_id AND o.source_state_hash=c.source_state_hash RETURNING o.entry_id,encode(o.source_state_hash,'hex'),o.submission_id,o.media_type) SELECT c.entry_id::text,c.encode,c.submission_id,c.media_type,f.data FROM claimed c JOIN {s}.file_contents f ON f.entry_id=c.entry_id JOIN {s}.entries e ON e.entry_id=c.entry_id AND encode(e.state_hash,'hex')=c.encode",
         s = quote(schema)
