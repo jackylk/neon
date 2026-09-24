@@ -29,6 +29,7 @@ struct Intent {
     schema: String,
     entry_id: String,
     state_hash: String,
+    lexical_profile_hash: String,
     submission_id: String,
     media_type: String,
     payload: Vec<u8>,
@@ -143,7 +144,7 @@ async fn claim(client: &mut tokio_postgres::Client, schema: &str) -> Result<Opti
     );
     transaction.execute(&supersede_sql, &[]).await?;
     let sql = format!(
-        "WITH candidate AS (SELECT entry_id,source_state_hash,submission_id,media_type FROM {s}.index_export_outbox WHERE status IN ('pending','uploading') AND available_at<=now() AND (lease_expires_at IS NULL OR lease_expires_at<=now()) ORDER BY available_at,entry_id FOR UPDATE SKIP LOCKED LIMIT 1), claimed AS (UPDATE {s}.index_export_outbox o SET status='uploading',attempts=attempts+1,lease_owner=$1,lease_expires_at=now()+interval '2 minutes',updated_at=now() FROM candidate c WHERE o.entry_id=c.entry_id AND o.source_state_hash=c.source_state_hash RETURNING o.entry_id,encode(o.source_state_hash,'hex'),o.submission_id,o.media_type) SELECT c.entry_id::text,c.encode,c.submission_id,c.media_type,f.data FROM claimed c JOIN {s}.file_contents f ON f.entry_id=c.entry_id JOIN {s}.entries e ON e.entry_id=c.entry_id AND encode(e.state_hash,'hex')=c.encode",
+        "WITH candidate AS (SELECT entry_id,source_state_hash,submission_id,media_type FROM {s}.index_export_outbox WHERE lexical_profile_hash IS NOT NULL AND status IN ('pending','uploading') AND available_at<=now() AND (lease_expires_at IS NULL OR lease_expires_at<=now()) ORDER BY available_at,entry_id FOR UPDATE SKIP LOCKED LIMIT 1), claimed AS (UPDATE {s}.index_export_outbox o SET status='uploading',attempts=attempts+1,lease_owner=$1,lease_expires_at=now()+interval '2 minutes',updated_at=now() FROM candidate c WHERE o.entry_id=c.entry_id AND o.source_state_hash=c.source_state_hash RETURNING o.entry_id,encode(o.source_state_hash,'hex') AS state_hash,encode(o.lexical_profile_hash,'hex') AS lexical_profile_hash,o.submission_id,o.media_type) SELECT c.entry_id::text,c.state_hash,c.lexical_profile_hash,c.submission_id,c.media_type,f.data FROM claimed c JOIN {s}.file_contents f ON f.entry_id=c.entry_id JOIN {s}.entries e ON e.entry_id=c.entry_id AND encode(e.state_hash,'hex')=c.state_hash",
         s = quote(schema)
     );
     let owner = std::env::var("HOSTNAME").unwrap_or_else(|_| "compute_ctl".into());
@@ -153,9 +154,10 @@ async fn claim(client: &mut tokio_postgres::Client, schema: &str) -> Result<Opti
         schema: schema.into(),
         entry_id: row.get(0),
         state_hash: row.get(1),
-        submission_id: row.get(2),
-        media_type: row.get(3),
-        payload: row.get(4),
+        lexical_profile_hash: row.get(2),
+        submission_id: row.get(3),
+        media_type: row.get(4),
+        payload: row.get(5),
     }))
 }
 
@@ -174,6 +176,10 @@ async fn publish(
     metadata.insert("x-index-payload-sha256".into(), checksum.clone());
     let encoded_revision = segment(intent.state_hash.clone());
     metadata.insert("x-index-source-revision".into(), encoded_revision.clone());
+    metadata.insert(
+        "x-index-lexical-profile-hash".into(),
+        intent.lexical_profile_hash.clone(),
+    );
     metadata.insert("x-index-created-at".into(), created_at());
     let response = s3
         .put_object()
@@ -343,6 +349,7 @@ mod tests {
             schema: "folder_rf_a".into(),
             entry_id: Uuid::nil().to_string(),
             state_hash: "11".repeat(32),
+            lexical_profile_hash: "22".repeat(32),
             submission_id: "event:1".into(),
             media_type: "text/markdown".into(),
             payload: vec![],
