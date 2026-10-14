@@ -1145,6 +1145,34 @@ USER root
 
 #########################################################################################
 #
+# Layer "age-build"
+# Apache AGE for PostgreSQL 17. Keep the source revision pinned to the locally
+# verified AGE 1.7.0 build; the same files are used by the production overlay.
+#
+#########################################################################################
+FROM build-deps AS age-src
+WORKDIR /ext-src
+RUN wget https://github.com/apache/age/archive/e1467f12e0b1d15dd35d3ab93f057a7112d425b8.tar.gz -O age.tar.gz && \
+    echo "da2a8c70033e08620ba9f9927b495908cc935ac80529d8f4d30cefae719efaa7 age.tar.gz" | sha256sum --check && \
+    mkdir age-src && tar xzf age.tar.gz --strip-components=1 -C age-src
+
+FROM pg-build AS age-build
+ARG PG_VERSION
+COPY --from=age-src /ext-src/age-src /ext-src/age-src
+WORKDIR /ext-src/age-src
+RUN case "${PG_VERSION:?}" in \
+        "v17") \
+            make -j $(getconf _NPROCESSORS_ONLN) PG_CONFIG=/usr/local/pgsql/bin/pg_config && \
+            make PG_CONFIG=/usr/local/pgsql/bin/pg_config install; \
+            ;; \
+        *) \
+            echo "Apache AGE 1.7.0 is packaged only for PostgreSQL 17; skipping ${PG_VERSION}" && \
+            rm -rf /usr/local/pgsql && mkdir -p /usr/local/pgsql; \
+            ;; \
+    esac
+
+#########################################################################################
+#
 # Layers "pg-onnx-build" and "pgrag-build"
 # Compile "pgrag" extensions
 #
@@ -1661,6 +1689,7 @@ COPY --from=pgrag-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=timescaledb-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_cron-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_partman-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=age-build /usr/local/pgsql/ /usr/local/pgsql/
 
 #########################################################################################
 #
@@ -1712,6 +1741,7 @@ COPY --from=pg_duckdb-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_repack-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pgaudit-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pgauditlogtofile-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=age-build /usr/local/pgsql/ /usr/local/pgsql/
 
 #########################################################################################
 #
