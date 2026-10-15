@@ -19,6 +19,8 @@ struct Config {
     tenant_id: String,
     namespace_id: String,
     source_generation: u64,
+    source_config_version: u64,
+    journal: bool,
     endpoint: String,
     region: String,
     bucket: String,
@@ -33,6 +35,18 @@ struct Intent {
     submission_id: String,
     media_type: String,
     payload: Vec<u8>,
+    lease_owner: String,
+    event: Option<EventIdentity>,
+}
+
+#[derive(Debug)]
+struct EventIdentity {
+    event_id: String,
+    fingerprint: String,
+    incarnation: i64,
+    source_config_version: i64,
+    job_kind: String,
+    content_hash: String,
 }
 
 pub fn launch_if_configured(compute: Arc<ComputeNode>) {
@@ -74,17 +88,22 @@ async fn run(compute: &ComputeNode) -> Result<()> {
             warn!(%error, "LakebaseFS exporter database connection ended");
         }
     });
-    for schema in discover_schemas(&client).await? {
-        let Some(intent) = claim(&mut client, &schema).await? else {
+    for schema in discover_schemas(&client, config.journal).await? {
+        let claimed = if config.journal {
+            claim_journal(&mut client, &schema, &config).await?
+        } else {
+            claim(&mut client, &schema).await?
+        };
+        let Some(intent) = claimed else {
             continue;
         };
         match publish(&s3, &config, &intent).await {
             Ok((key, version, checksum)) => {
-                acknowledge(&client, &intent, &key, &version, &checksum).await?;
+                acknowledge(&mut client, &intent, &key, &version, &checksum).await?;
                 info!(schema=%intent.schema, entry=%intent.entry_id, %key, "exported LakebaseFS index input");
             }
             Err(error) => {
-                retry(&client, &intent, &error.to_string()).await?;
+                retry(&mut client, &intent, &error.to_string()).await?;
                 warn!(schema=%intent.schema, entry=%intent.entry_id, %error, "index input export will retry");
             }
         }
@@ -115,11 +134,28 @@ impl Config {
             .context("compute assignment has no database")?
             .name
             .clone();
+        let journal = match export.protocol.as_deref() {
+            None | Some("legacy-v1") => false,
+            Some("event-v2") => true,
+            Some(_) => bail!("unknown LakebaseFS export protocol"),
+        };
+        if journal
+            && (export.workspace_incarnation != Some(export.source_generation)
+                || export.source_generation == 0
+                || export.source_generation > i64::MAX as u64
+                || export
+                    .source_config_version
+                    .is_none_or(|version| version == 0 || version > i64::MAX as u64))
+        {
+            bail!("event-v2 requires explicit matching incarnation and source configuration");
+        }
         Ok(Self {
             database_name,
             tenant_id: export.tenant_id.clone(),
             namespace_id: export.namespace_id.clone(),
             source_generation: export.source_generation,
+            source_config_version: export.source_config_version.unwrap_or(1),
+            journal,
             endpoint: required("LBFS_INDEX_OBS_ENDPOINT")?,
             region: required("AWS_REGION")?,
             bucket: required("LBFS_INDEX_OBS_BUCKET")?,
@@ -127,8 +163,13 @@ impl Config {
     }
 }
 
-async fn discover_schemas(client: &tokio_postgres::Client) -> Result<Vec<String>> {
-    let rows = client.query("SELECT n.nspname FROM pg_namespace n JOIN pg_class c ON c.relnamespace=n.oid WHERE c.relname='index_export_outbox' AND c.relkind='r' AND n.nspname !~ '^pg_' ORDER BY n.nspname", &[]).await?;
+async fn discover_schemas(client: &tokio_postgres::Client, journal: bool) -> Result<Vec<String>> {
+    let table = if journal {
+        "index_export_intents"
+    } else {
+        "index_export_outbox"
+    };
+    let rows = client.query("SELECT n.nspname FROM pg_namespace n JOIN pg_class c ON c.relnamespace=n.oid WHERE c.relname=$1 AND c.relkind='r' AND n.nspname !~ '^pg_' ORDER BY n.nspname", &[&table]).await?;
     Ok(rows
         .into_iter()
         .map(|row| row.get(0))
@@ -147,7 +188,8 @@ async fn claim(client: &mut tokio_postgres::Client, schema: &str) -> Result<Opti
         "WITH candidate AS (SELECT entry_id,source_state_hash,submission_id,media_type FROM {s}.index_export_outbox WHERE lexical_profile_hash IS NOT NULL AND status IN ('pending','uploading') AND available_at<=now() AND (lease_expires_at IS NULL OR lease_expires_at<=now()) ORDER BY available_at,entry_id FOR UPDATE SKIP LOCKED LIMIT 1), claimed AS (UPDATE {s}.index_export_outbox o SET status='uploading',attempts=attempts+1,lease_owner=$1,lease_expires_at=now()+interval '2 minutes',updated_at=now() FROM candidate c WHERE o.entry_id=c.entry_id AND o.source_state_hash=c.source_state_hash RETURNING o.entry_id,encode(o.source_state_hash,'hex') AS state_hash,encode(o.lexical_profile_hash,'hex') AS lexical_profile_hash,o.submission_id,o.media_type) SELECT c.entry_id::text,c.state_hash,c.lexical_profile_hash,c.submission_id,c.media_type,f.data FROM claimed c JOIN {s}.file_contents f ON f.entry_id=c.entry_id JOIN {s}.entries e ON e.entry_id=c.entry_id AND encode(e.state_hash,'hex')=c.state_hash",
         s = quote(schema)
     );
-    let owner = std::env::var("HOSTNAME").unwrap_or_else(|_| "compute_ctl".into());
+    // A hostname is shared by consecutive attempts. Each claim needs its own token.
+    let owner = Uuid::new_v4().to_string();
     let row = transaction.query_opt(&sql, &[&owner]).await?;
     transaction.commit().await?;
     Ok(row.map(|row| Intent {
@@ -158,7 +200,184 @@ async fn claim(client: &mut tokio_postgres::Client, schema: &str) -> Result<Opti
         submission_id: row.get(3),
         media_type: row.get(4),
         payload: row.get(5),
+        lease_owner: owner,
+        event: None,
     }))
+}
+
+/// An explicit event-v2 source assignment is required; legacy timeline-derived
+/// source generations are never silently relabelled to workspace incarnation 1.
+async fn journal_scope(
+    transaction: &tokio_postgres::Transaction<'_>,
+    schema: &str,
+) -> Result<Option<(i64, i64)>> {
+    let row = transaction
+        .query_one(
+            &format!(
+                "SELECT incarnation,state FROM {}.lbfs_runtime_fence WHERE singleton FOR SHARE",
+                quote(schema)
+            ),
+            &[],
+        )
+        .await?;
+    let incarnation: i64 = row.get(0);
+    let state: String = row.get(1);
+    if !matches!(state.as_str(), "RUNNING" | "QUIESCING") {
+        return Ok(None);
+    }
+    let config = transaction
+        .query_one(
+            &format!(
+                "SELECT source_config_version FROM {}.lbfs_export_config WHERE singleton FOR SHARE",
+                quote(schema)
+            ),
+            &[],
+        )
+        .await?;
+    Ok(Some((incarnation, config.get(0))))
+}
+
+async fn claim_journal(
+    client: &mut tokio_postgres::Client,
+    schema: &str,
+    config: &Config,
+) -> Result<Option<Intent>> {
+    let transaction = client.transaction().await?;
+    let Some((incarnation, version)) = journal_scope(&transaction, schema).await? else {
+        return Ok(None);
+    };
+    if incarnation as u64 != config.source_generation
+        || version as u64 != config.source_config_version
+    {
+        bail!("export assignment no longer matches current workspace/source configuration");
+    }
+    let s = quote(schema);
+    // Old-world events are retained for explicit retirement. Only supersede current
+    // file work after its referenced revision is no longer the current entry.
+    transaction.execute(&format!("UPDATE {s}.index_export_intents i SET status='dead',lease_token=NULL,lease_expires_at=NULL,last_error='source revision superseded',updated_at=clock_timestamp() WHERE i.incarnation=$1 AND i.source_config_version=$2 AND i.job_kind IN ('file_content','repair') AND i.status IN ('pending','uploading') AND NOT EXISTS(SELECT 1 FROM {s}.entries e WHERE e.entry_id=i.entry_id AND e.state_hash=i.source_state_hash AND e.content_hash=i.content_hash)"),&[&incarnation,&version]).await?;
+    let token = Uuid::new_v4().to_string();
+    // Unsupported job kinds stay pending and prevent a clean handoff; they must
+    // never be ACKed as a file task merely to make the drain count reach zero.
+    let sql = format!(
+        "WITH candidate AS (SELECT i.event_id FROM {s}.index_export_intents i JOIN {s}.entries e ON e.entry_id=i.entry_id AND e.state_hash=i.source_state_hash AND e.content_hash=i.content_hash JOIN {s}.file_contents f ON f.entry_id=e.entry_id WHERE i.incarnation=$1 AND i.source_config_version=$2 AND i.job_kind IN ('file_content','repair') AND i.lexical_profile_hash IS NOT NULL AND i.status IN ('pending','uploading') AND i.available_at<=clock_timestamp() AND (i.lease_expires_at IS NULL OR i.lease_expires_at<=clock_timestamp()) ORDER BY i.available_at,i.event_id FOR UPDATE OF i SKIP LOCKED LIMIT 1), claimed AS (UPDATE {s}.index_export_intents i SET status='uploading',attempts=attempts+1,lease_token=$3::text::uuid,lease_expires_at=clock_timestamp()+interval '2 minutes',updated_at=clock_timestamp() FROM candidate c WHERE i.event_id=c.event_id RETURNING i.*) SELECT c.event_id::text,c.entry_id::text,encode(c.source_state_hash,'hex'),encode(c.fingerprint,'hex'),c.incarnation,c.source_config_version,c.job_kind,encode(c.lexical_profile_hash,'hex'),c.media_type,f.data,encode(c.content_hash,'hex') FROM claimed c JOIN {s}.file_contents f ON f.entry_id=c.entry_id"
+    );
+    let row = transaction
+        .query_opt(&sql, &[&incarnation, &version, &token])
+        .await?;
+    transaction.commit().await?;
+    Ok(row.map(|row| {
+        let event_id: String = row.get(0);
+        Intent {
+            schema: schema.into(),
+            entry_id: row.get(1),
+            state_hash: row.get(2),
+            lexical_profile_hash: row.get(7),
+            submission_id: event_id.clone(),
+            media_type: row.get(8),
+            payload: row.get(9),
+            lease_owner: token,
+            event: Some(EventIdentity {
+                event_id,
+                fingerprint: row.get(3),
+                incarnation: row.get(4),
+                source_config_version: row.get(5),
+                job_kind: row.get(6),
+                content_hash: row.get(10),
+            }),
+        }
+    }))
+}
+
+fn source_id(config: &Config, intent: &Intent) -> Uuid {
+    if let Some(event) = &intent.event {
+        deterministic_source_id(
+            &config.tenant_id,
+            &format!("{}:incarnation:{}", intent.schema, event.incarnation),
+        )
+    } else {
+        deterministic_source_id(&config.tenant_id, &intent.schema)
+    }
+}
+
+async fn acknowledge_journal(
+    client: &mut tokio_postgres::Client,
+    intent: &Intent,
+    key: &str,
+    version: &str,
+    checksum: &str,
+) -> Result<()> {
+    let event = intent.event.as_ref().context("event identity required")?;
+    let transaction = client.transaction().await?;
+    if journal_scope(&transaction, &intent.schema).await?
+        != Some((event.incarnation, event.source_config_version))
+    {
+        bail!("export acknowledgement belongs to an old workspace/source");
+    }
+    let sql = format!(
+        "UPDATE {}.index_export_intents SET status='exported',object_key=$1,object_version_id=$2,object_checksum=$3,object_size=$4,last_error=NULL,updated_at=clock_timestamp() WHERE event_id=$5::text::uuid AND entry_id=$6::text::uuid AND source_state_hash=decode($7,'hex') AND fingerprint=decode($8,'hex') AND incarnation=$9 AND source_config_version=$10 AND job_kind=$11 AND lease_token=$12::text::uuid AND ((status='uploading' AND lease_expires_at>clock_timestamp()) OR (status='exported' AND object_key=$1 AND object_version_id=$2 AND object_checksum=$3 AND object_size=$4))",
+        quote(&intent.schema)
+    );
+    let size = intent.payload.len() as i64;
+    let changed = transaction
+        .execute(
+            &sql,
+            &[
+                &key,
+                &version,
+                &checksum,
+                &size,
+                &event.event_id,
+                &intent.entry_id,
+                &intent.state_hash,
+                &event.fingerprint,
+                &event.incarnation,
+                &event.source_config_version,
+                &event.job_kind,
+                &intent.lease_owner,
+            ],
+        )
+        .await?;
+    if changed != 1 {
+        bail!("export acknowledgement lost its event lease");
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
+async fn retry_journal(
+    client: &mut tokio_postgres::Client,
+    intent: &Intent,
+    error: &str,
+) -> Result<()> {
+    let event = intent.event.as_ref().context("event identity required")?;
+    let transaction = client.transaction().await?;
+    if journal_scope(&transaction, &intent.schema).await?
+        != Some((event.incarnation, event.source_config_version))
+    {
+        return Ok(());
+    }
+    let sql = format!(
+        "UPDATE {}.index_export_intents SET status='pending',available_at=clock_timestamp()+interval '10 seconds',lease_token=NULL,lease_expires_at=NULL,last_error=$1,updated_at=clock_timestamp() WHERE event_id=$2::text::uuid AND entry_id=$3::text::uuid AND source_state_hash=decode($4,'hex') AND fingerprint=decode($5,'hex') AND incarnation=$6 AND source_config_version=$7 AND job_kind=$8 AND status='uploading' AND lease_token=$9::text::uuid AND lease_expires_at>clock_timestamp()",
+        quote(&intent.schema)
+    );
+    transaction
+        .execute(
+            &sql,
+            &[
+                &error.chars().take(1000).collect::<String>(),
+                &event.event_id,
+                &intent.entry_id,
+                &intent.state_hash,
+                &event.fingerprint,
+                &event.incarnation,
+                &event.source_config_version,
+                &event.job_kind,
+                &intent.lease_owner,
+            ],
+        )
+        .await?;
+    transaction.commit().await?;
+    Ok(())
 }
 
 async fn publish(
@@ -167,7 +386,14 @@ async fn publish(
     intent: &Intent,
 ) -> Result<(String, String, String)> {
     let checksum = hex::encode(Sha256::digest(&intent.payload));
-    let source_id = deterministic_source_id(&config.tenant_id, &intent.schema);
+    if let Some(event) = &intent.event {
+        if matches!(event.job_kind.as_str(), "file_content" | "repair")
+            && event.content_hash != checksum
+        {
+            bail!("source content checksum does not match committed export intent");
+        }
+    }
+    let source_id = source_id(config, intent);
     let key = object_key(config, intent, source_id);
     let mut metadata = HashMap::new();
     metadata.insert("x-index-contract".into(), "document-object/v1".into());
@@ -181,39 +407,140 @@ async fn publish(
         intent.lexical_profile_hash.clone(),
     );
     metadata.insert("x-index-created-at".into(), created_at());
+    // Reconcile a completed PUT whose ACK/response was lost. A deterministic key
+    // is immutable: a conflicting object is evidence to retain, never overwrite.
+    if let Some(version) = existing_version(s3, config, &key).await? {
+        verify_version(s3, config, intent, &key, &version, &checksum).await?;
+        return Ok((key, version, checksum));
+    }
     let response = s3
         .put_object()
         .bucket(&config.bucket)
         .key(&key)
+        .if_none_match("*")
+        .checksum_sha256(
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&intent.payload)),
+        )
         .set_metadata(Some(metadata))
         .content_type(&intent.media_type)
         .body(ByteStream::from(intent.payload.clone()))
         .send()
-        .await?;
-    let version = response.version_id().unwrap_or_default().to_string();
-    if version.is_empty() {
+        .await;
+    let version = match response {
+        Ok(response) => response.version_id().unwrap_or_default().to_string(),
+        Err(error) => {
+            // Includes a concurrent winning PUT and an ambiguous connection loss
+            // after the server committed. All other HEAD errors fail closed.
+            if let Some(version) = existing_version(s3, config, &key).await? {
+                verify_version(s3, config, intent, &key, &version, &checksum).await?;
+                return Ok((key, version, checksum));
+            }
+            return Err(error.into());
+        }
+    };
+    verify_version(s3, config, intent, &key, &version, &checksum).await?;
+    Ok((key, version, checksum))
+}
+
+async fn existing_version(
+    s3: &aws_sdk_s3::Client,
+    config: &Config,
+    key: &str,
+) -> Result<Option<String>> {
+    match s3
+        .head_object()
+        .bucket(&config.bucket)
+        .key(key)
+        .send()
+        .await
+    {
+        Ok(head) => Ok(Some(head.version_id().unwrap_or_default().to_string())),
+        Err(error)
+            if error
+                .as_service_error()
+                .is_some_and(|service| service.is_not_found()) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn verify_version(
+    s3: &aws_sdk_s3::Client,
+    config: &Config,
+    intent: &Intent,
+    key: &str,
+    version: &str,
+    checksum: &str,
+) -> Result<()> {
+    if version.is_empty() || version == "null" {
         bail!("OBS bucket did not return an immutable version ID");
     }
     let head = s3
         .head_object()
         .bucket(&config.bucket)
-        .key(&key)
-        .version_id(&version)
+        .key(key)
+        .version_id(version)
         .send()
         .await?;
-    if head.content_length() != Some(intent.payload.len() as i64)
-        || head
-            .metadata()
-            .and_then(|value| value.get("x-index-payload-sha256"))
-            != Some(&checksum)
-        || head
-            .metadata()
-            .and_then(|value| value.get("x-index-source-revision"))
-            != Some(&encoded_revision)
+    let encoded_revision = segment(intent.state_hash.clone());
+    let metadata = head.metadata().context("OBS input metadata is missing")?;
+    const FIELDS: [&str; 7] = [
+        "x-index-contract",
+        "x-index-input-kind",
+        "x-index-media-type",
+        "x-index-payload-sha256",
+        "x-index-source-revision",
+        "x-index-lexical-profile-hash",
+        "x-index-created-at",
+    ];
+    let created_valid = metadata
+        .get("x-index-created-at")
+        .is_some_and(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok());
+    if head.version_id() != Some(version)
+        || !created_valid
+        || metadata
+            .keys()
+            .any(|key| key.starts_with("x-index-") && !FIELDS.contains(&key.as_str()))
+        || metadata.get("x-index-media-type") != Some(&intent.media_type)
+        || head.content_length() != Some(intent.payload.len() as i64)
+        || head.content_type() != Some(intent.media_type.as_str())
+        || metadata.get("x-index-contract").map(String::as_str) != Some("document-object/v1")
+        || metadata.get("x-index-input-kind").map(String::as_str) != Some("raw_file")
+        || metadata.get("x-index-payload-sha256").map(String::as_str) != Some(checksum)
+        || metadata.get("x-index-source-revision") != Some(&encoded_revision)
+        || metadata.get("x-index-lexical-profile-hash") != Some(&intent.lexical_profile_hash)
     {
-        bail!("OBS immutable object verification failed");
+        bail!("OBS immutable object metadata verification failed");
     }
-    Ok((key, version, checksum))
+    // Custom metadata is not proof of actual body bytes. Read the exact version,
+    // bound the stream to the expected size, and independently hash it before ACK.
+    let response = s3
+        .get_object()
+        .bucket(&config.bucket)
+        .key(key)
+        .version_id(version)
+        .send()
+        .await?;
+    if response.version_id() != Some(version) {
+        bail!("OBS returned a different object version");
+    }
+    let mut body = response.body;
+    let mut hash = Sha256::new();
+    let mut size = 0usize;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk?;
+        size = size.checked_add(chunk.len()).context("OBS size overflow")?;
+        if size > intent.payload.len() {
+            bail!("OBS exact version exceeds expected size");
+        }
+        hash.update(&chunk);
+    }
+    if size != intent.payload.len() || hex::encode(hash.finalize()) != checksum {
+        bail!("OBS immutable object body verification failed");
+    }
+    Ok(())
 }
 
 fn created_at() -> String {
@@ -225,7 +552,7 @@ fn object_key(config: &Config, intent: &Intent, source_id: Uuid) -> String {
         config.tenant_id.clone(),
         config.namespace_id.clone(),
         source_id.to_string(),
-        "1".into(),
+        config.source_config_version.to_string(),
         config.source_generation.to_string(),
         intent.schema.clone(),
         intent.entry_id.clone(),
@@ -257,14 +584,17 @@ fn deterministic_source_id(tenant: &str, collection: &str) -> Uuid {
 }
 
 async fn acknowledge(
-    client: &tokio_postgres::Client,
+    client: &mut tokio_postgres::Client,
     intent: &Intent,
     key: &str,
     version: &str,
     checksum: &str,
 ) -> Result<()> {
+    if intent.event.is_some() {
+        return acknowledge_journal(client, intent, key, version, checksum).await;
+    }
     let sql = format!(
-        "UPDATE {s}.index_export_outbox SET status='exported',object_key=$1,object_version_id=$2,object_checksum=$3,lease_owner=NULL,lease_expires_at=NULL,last_error=NULL,updated_at=now() WHERE entry_id=$4::uuid AND source_state_hash=decode($5,'hex') AND status='uploading'",
+        "UPDATE {s}.index_export_outbox SET status='exported',object_key=$1,object_version_id=$2,object_checksum=$3,lease_owner=NULL,lease_expires_at=NULL,last_error=NULL,updated_at=now() WHERE entry_id=$4::text::uuid AND source_state_hash=decode($5,'hex') AND lexical_profile_hash=decode($6,'hex') AND submission_id=$7 AND lease_owner=$8 AND lease_expires_at>clock_timestamp() AND status='uploading'",
         s = quote(&intent.schema)
     );
     if client
@@ -276,6 +606,9 @@ async fn acknowledge(
                 &checksum,
                 &intent.entry_id,
                 &intent.state_hash,
+                &intent.lexical_profile_hash,
+                &intent.submission_id,
+                &intent.lease_owner,
             ],
         )
         .await?
@@ -286,9 +619,12 @@ async fn acknowledge(
     Ok(())
 }
 
-async fn retry(client: &tokio_postgres::Client, intent: &Intent, error: &str) -> Result<()> {
+async fn retry(client: &mut tokio_postgres::Client, intent: &Intent, error: &str) -> Result<()> {
+    if intent.event.is_some() {
+        return retry_journal(client, intent, error).await;
+    }
     let sql = format!(
-        "UPDATE {s}.index_export_outbox SET status='pending',available_at=now()+interval '10 seconds',lease_owner=NULL,lease_expires_at=NULL,last_error=$1,updated_at=now() WHERE entry_id=$2::uuid AND source_state_hash=decode($3,'hex')",
+        "UPDATE {s}.index_export_outbox SET status='pending',available_at=now()+interval '10 seconds',lease_owner=NULL,lease_expires_at=NULL,last_error=$1,updated_at=now() WHERE entry_id=$2::text::uuid AND source_state_hash=decode($3,'hex') AND lexical_profile_hash=decode($4,'hex') AND submission_id=$5 AND lease_owner=$6 AND lease_expires_at>clock_timestamp() AND status='uploading'",
         s = quote(&intent.schema)
     );
     client
@@ -298,6 +634,9 @@ async fn retry(client: &tokio_postgres::Client, intent: &Intent, error: &str) ->
                 &error.chars().take(1000).collect::<String>(),
                 &intent.entry_id,
                 &intent.state_hash,
+                &intent.lexical_profile_hash,
+                &intent.submission_id,
+                &intent.lease_owner,
             ],
         )
         .await?;
@@ -323,6 +662,408 @@ fn required(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct TestPostgres(String);
+    impl Drop for TestPostgres {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", &self.0])
+                .output();
+        }
+    }
+    async fn postgres() -> (TestPostgres, tokio_postgres::Client) {
+        let output = std::process::Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "-d",
+                "-p",
+                "127.0.0.1::5432",
+                "-e",
+                "POSTGRES_HOST_AUTH_METHOD=trust",
+                "postgres:17",
+            ])
+            .output()
+            .expect("Docker required for actual exporter SQL races");
+        assert!(
+            output.status.success(),
+            "Postgres test container did not start"
+        );
+        let owned = TestPostgres(String::from_utf8(output.stdout).unwrap().trim().to_string());
+        let output = std::process::Command::new("docker")
+            .args(["port", &owned.0, "5432/tcp"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let address = String::from_utf8(output.stdout).unwrap();
+        let port: u16 = address.trim().rsplit(':').next().unwrap().parse().unwrap();
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host("127.0.0.1")
+            .port(port)
+            .user("postgres")
+            .dbname("postgres");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            match config.connect(tokio_postgres::NoTls).await {
+                Ok((client, connection)) => {
+                    tokio::spawn(async move {
+                        let _ = connection.await;
+                    });
+                    return (owned, client);
+                }
+                Err(error) if std::time::Instant::now() >= deadline => {
+                    panic!("Postgres test readiness: {error}")
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn late_legacy_ack_and_retry_cannot_modify_a_reclaimed_lease() {
+        let (_owned, mut client) = postgres().await;
+        client.batch_execute("CREATE SCHEMA folder_a;
+            CREATE TABLE folder_a.entries(entry_id uuid PRIMARY KEY,state_hash bytea);
+            CREATE TABLE folder_a.file_contents(entry_id uuid PRIMARY KEY,data bytea);
+            CREATE TABLE folder_a.index_export_outbox(entry_id uuid,source_state_hash bytea,lexical_profile_hash bytea,
+                submission_id text,media_type text,status text,available_at timestamptz DEFAULT now(),lease_owner text,
+                lease_expires_at timestamptz,attempts int DEFAULT 0,last_error text,updated_at timestamptz DEFAULT now(),
+                object_key text,object_version_id text,object_checksum text);
+            INSERT INTO folder_a.entries VALUES('00000000-0000-0000-0000-000000000001',decode(repeat('11',32),'hex'));
+            INSERT INTO folder_a.file_contents VALUES('00000000-0000-0000-0000-000000000001',decode('6162','hex'));
+            INSERT INTO folder_a.index_export_outbox(entry_id,source_state_hash,lexical_profile_hash,submission_id,media_type,status)
+            VALUES('00000000-0000-0000-0000-000000000001',decode(repeat('11',32),'hex'),decode(repeat('22',32),'hex'),'event-a','text/markdown','pending');").await.unwrap();
+        let first = claim(&mut client, "folder_a").await.unwrap().unwrap();
+        client.execute("UPDATE folder_a.index_export_outbox SET lease_expires_at=now()-interval '1 second'", &[]).await.unwrap();
+        let next = claim(&mut client, "folder_a").await.unwrap().unwrap();
+        assert!(
+            acknowledge(&mut client, &first, "key", "old-version", &"33".repeat(32))
+                .await
+                .is_err(),
+            "old process must not ACK another upload attempt"
+        );
+        retry(&mut client, &first, "old process error")
+            .await
+            .unwrap();
+        assert!(
+            acknowledge(&mut client, &next, "key", "new-version", &"33".repeat(32))
+                .await
+                .is_ok(),
+            "late retry must not reset a reclaimed live attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn journal_full_identity_lease_and_restore_fence_are_enforced_by_actual_postgres() {
+        let (_owned, mut client) = postgres().await;
+        client
+            .batch_execute("CREATE SCHEMA folder_v2; SET search_path=folder_v2,public;")
+            .await
+            .unwrap();
+        client
+            .batch_execute(include_str!("index_export_event_v2.sql"))
+            .await
+            .unwrap();
+        client.batch_execute("CREATE TABLE lbfs_runtime_fence(singleton boolean PRIMARY KEY,incarnation bigint,state text);
+            INSERT INTO lbfs_runtime_fence VALUES(true,1,'RUNNING');
+            CREATE TABLE entries(entry_id uuid PRIMARY KEY,state_hash bytea,content_hash bytea);
+            CREATE TABLE file_contents(entry_id uuid PRIMARY KEY,data bytea);
+            INSERT INTO entries VALUES('00000000-0000-0000-0000-000000000001',decode(repeat('11',32),'hex'),decode(repeat('44',32),'hex'));
+            INSERT INTO file_contents VALUES('00000000-0000-0000-0000-000000000001',decode('6162','hex'));
+            INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,media_type)
+            VALUES('00000000-0000-0000-0000-000000000011','00000000-0000-0000-0000-000000000001',decode(repeat('11',32),'hex'),decode(repeat('22',32),'hex'),1,1,'file_content',decode(repeat('44',32),'hex'),decode(repeat('33',32),'hex'),'text/markdown');").await.unwrap();
+        let mut config = Config {
+            database_name: "test".into(),
+            tenant_id: "test-tenant".into(),
+            namespace_id: "lakebasefs".into(),
+            source_generation: 1,
+            source_config_version: 1,
+            journal: true,
+            endpoint: "test".into(),
+            region: "test".into(),
+            bucket: "test".into(),
+        };
+        let first = claim_journal(&mut client, "folder_v2", &config)
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .execute(
+                "UPDATE index_export_intents SET lease_expires_at=now()-interval '1 second'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let next = claim_journal(&mut client, "folder_v2", &config)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(first.lease_owner, next.lease_owner);
+        assert!(
+            acknowledge(&mut client, &first, "key", "old-version", &"55".repeat(32))
+                .await
+                .is_err()
+        );
+        retry(&mut client, &first, "late failure").await.unwrap();
+        acknowledge(&mut client, &next, "key", "new-version", &"55".repeat(32))
+            .await
+            .unwrap();
+        acknowledge(&mut client, &next, "key", "new-version", &"55".repeat(32))
+            .await
+            .unwrap();
+        assert!(
+            acknowledge(
+                &mut client,
+                &next,
+                "key",
+                "conflicting-version",
+                &"55".repeat(32)
+            )
+            .await
+            .is_err()
+        );
+        let mut forged = next;
+        forged.event.as_mut().unwrap().fingerprint = "66".repeat(32);
+        assert!(
+            acknowledge(&mut client, &forged, "key", "new-version", &"55".repeat(32))
+                .await
+                .is_err()
+        );
+        forged.event.as_mut().unwrap().fingerprint = "22".repeat(32);
+        let old_source = source_id(&config, &forged);
+        let old_key = object_key(&config, &forged, old_source);
+        client
+            .execute("UPDATE lbfs_runtime_fence SET incarnation=2", &[])
+            .await
+            .unwrap();
+        assert!(
+            acknowledge(&mut client, &forged, "key", "new-version", &"55".repeat(32))
+                .await
+                .is_err()
+        );
+        assert!(
+            claim_journal(&mut client, "folder_v2", &config)
+                .await
+                .is_err(),
+            "never silently upgrade an old source assignment"
+        );
+        config.source_generation = 2;
+        client.batch_execute("INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,media_type)
+            VALUES('00000000-0000-0000-0000-000000000012','00000000-0000-0000-0000-000000000001',decode(repeat('11',32),'hex'),decode(repeat('22',32),'hex'),2,1,'file_content',decode(repeat('44',32),'hex'),decode(repeat('33',32),'hex'),'text/markdown');").await.unwrap();
+        let restored = claim_journal(&mut client, "folder_v2", &config)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(source_id(&config, &restored), old_source);
+        assert_ne!(
+            object_key(&config, &restored, source_id(&config, &restored)),
+            old_key
+        );
+        client
+            .execute("UPDATE lbfs_export_config SET source_config_version=2", &[])
+            .await
+            .unwrap();
+        assert!(
+            acknowledge(
+                &mut client,
+                &restored,
+                "key",
+                "restored-version",
+                &"55".repeat(32)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            claim_journal(&mut client, "folder_v2", &config)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_ack_reuses_exact_version_and_same_key_corruption_is_not_overwritten() {
+        let output = std::process::Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "-d",
+                "-p",
+                "127.0.0.1::9000",
+                "-e",
+                "MINIO_ROOT_USER=minioadmin",
+                "-e",
+                "MINIO_ROOT_PASSWORD=minioadmin",
+                "lakeon-test/minio:20241107-cefc43e4daa4",
+                "server",
+                "/data",
+            ])
+            .output()
+            .expect("Docker required for actual versioned object handoff");
+        assert!(
+            output.status.success(),
+            "MinIO test container did not start"
+        );
+        let owned = TestPostgres(String::from_utf8(output.stdout).unwrap().trim().to_string());
+        let output = std::process::Command::new("docker")
+            .args(["port", &owned.0, "9000/tcp"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let address = String::from_utf8(output.stdout).unwrap();
+        let port: u16 = address.trim().rsplit(':').next().unwrap().parse().unwrap();
+        let config = Config {
+            database_name: "test".into(),
+            tenant_id: "test-tenant".into(),
+            namespace_id: "lakebasefs".into(),
+            source_generation: 1,
+            source_config_version: 1,
+            journal: false,
+            endpoint: format!("http://127.0.0.1:{port}"),
+            region: "us-east-1".into(),
+            bucket: "lbfs-export-test".into(),
+        };
+        let sdk = aws_sdk_s3::config::Builder::new()
+            .behavior_version(BehaviorVersion::v2024_03_28())
+            .region(Region::new(config.region.clone()))
+            .endpoint_url(&config.endpoint)
+            .force_path_style(true)
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "minioadmin",
+                "minioadmin",
+                None,
+                None,
+                "isolated-test",
+            ))
+            .build();
+        let s3 = aws_sdk_s3::Client::from_conf(sdk);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if s3
+                .create_bucket()
+                .bucket(&config.bucket)
+                .send()
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "MinIO test readiness");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        s3.put_bucket_versioning()
+            .bucket(&config.bucket)
+            .versioning_configuration(
+                aws_sdk_s3::types::VersioningConfiguration::builder()
+                    .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        let intent = Intent {
+            schema: "folder_a".into(),
+            entry_id: Uuid::nil().to_string(),
+            state_hash: "11".repeat(32),
+            lexical_profile_hash: "22".repeat(32),
+            submission_id: "immutable-event-1".into(),
+            media_type: "text/markdown".into(),
+            payload: b"hello".to_vec(),
+            lease_owner: Uuid::new_v4().to_string(),
+            event: None,
+        };
+        let first = publish(&s3, &config, &intent).await.unwrap();
+        let replay = publish(&s3, &config, &intent).await.unwrap();
+        assert_eq!(
+            first, replay,
+            "lost ACK must reconcile the existing immutable version rather than PUT another one"
+        );
+        let head = s3
+            .head_object()
+            .bucket(&config.bucket)
+            .key(&first.0)
+            .version_id(&first.1)
+            .send()
+            .await
+            .unwrap();
+        for field in [
+            "x-index-media-type",
+            "x-index-created-at",
+            "x-index-unrecognized",
+        ] {
+            let mut metadata = head.metadata().cloned().unwrap();
+            metadata.insert(field.into(), "invalid-contract-value".into());
+            s3.put_object()
+                .bucket(&config.bucket)
+                .key(&first.0)
+                .set_metadata(Some(metadata))
+                .content_type(&intent.media_type)
+                .body(ByteStream::from_static(b"hello"))
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                publish(&s3, &config, &intent).await.is_err(),
+                "contract metadata mismatch must not be ACKed: {field}"
+            );
+        }
+        let corrupt = s3
+            .put_object()
+            .bucket(&config.bucket)
+            .key(&first.0)
+            .set_metadata(head.metadata().cloned())
+            .content_type(&intent.media_type)
+            .body(ByteStream::from_static(b"xxxxx"))
+            .send()
+            .await
+            .unwrap();
+        let corrupt_version = corrupt.version_id().unwrap();
+        assert!(
+            publish(&s3, &config, &intent).await.is_err(),
+            "metadata checksum alone is not evidence of actual bytes"
+        );
+        let latest = s3
+            .head_object()
+            .bucket(&config.bucket)
+            .key(&first.0)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            latest.version_id(),
+            Some(corrupt_version),
+            "a conflicting deterministic key must not be overwritten"
+        );
+        let old = s3
+            .get_object()
+            .bucket(&config.bucket)
+            .key(&first.0)
+            .version_id(&first.1)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            old.body.collect().await.unwrap().into_bytes().as_ref(),
+            b"hello"
+        );
+        let malformed = Intent {
+            submission_id: "bad-source-checksum".into(),
+            event: Some(EventIdentity {
+                event_id: Uuid::new_v4().to_string(),
+                fingerprint: "22".repeat(32),
+                incarnation: 1,
+                source_config_version: 1,
+                job_kind: "file_content".into(),
+                content_hash: "00".repeat(32),
+            }),
+            ..intent
+        };
+        assert!(
+            publish(&s3, &config, &malformed).await.is_err(),
+            "exported body must match the committed source content hash"
+        );
+    }
+
     #[test]
     fn created_at_uses_utc_z_suffix_required_by_index_contract() {
         let value = created_at();
@@ -341,6 +1082,8 @@ mod tests {
             tenant_id: "tenant-a".into(),
             namespace_id: "lakebasefs".into(),
             source_generation: 7,
+            source_config_version: 1,
+            journal: false,
             endpoint: "x".into(),
             region: "x".into(),
             bucket: "x".into(),
@@ -353,6 +1096,8 @@ mod tests {
             submission_id: "event:1".into(),
             media_type: "text/markdown".into(),
             payload: vec![],
+            lease_owner: Uuid::nil().to_string(),
+            event: None,
         };
         assert!(object_key(&config, &intent, source).starts_with("index/v1/inputs/"));
         assert_eq!(object_key(&config, &intent, source).split('/').count(), 13);

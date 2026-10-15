@@ -225,6 +225,13 @@ pub struct LakeonIndexExportSpec {
     pub tenant_id: String,
     pub namespace_id: String,
     pub source_generation: u64,
+    /// Absent means the existing outbox protocol. Switching requires source reconciliation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_incarnation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_config_version: Option<u64>,
 }
 
 /// Feature flag to signal `compute_ctl` to enable certain experimental functionality.
