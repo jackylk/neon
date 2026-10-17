@@ -15,6 +15,11 @@ FROM ${COMPUTE_CTL_IMAGE} AS compiler
 FROM ${BASE_IMAGE}
 ARG BUILD_TAG
 LABEL org.opencontainers.image.revision="${BUILD_TAG}"
+# The retained runtime installs C.utf8, not its inherited en_US.utf8 default.
+# Empty pooled Computes run initdb before exposing HTTP; an unavailable LANG
+# prevents that path from ever becoming Ready. Existing database collations
+# remain recorded in their timelines.
+ENV LANG=C.UTF-8
 USER root
 RUN test -n "${BUILD_TAG}" && \
     grep -q 'compute_ctl.orig' /usr/local/bin/compute_ctl && \
