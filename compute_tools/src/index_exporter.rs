@@ -14,6 +14,8 @@ use uuid::Uuid;
 
 use crate::compute::ComputeNode;
 
+mod canonical;
+
 #[derive(Clone)]
 struct Config {
     database_name: String,
@@ -212,15 +214,27 @@ async fn spool_claim(
         .batch_execute("SAVEPOINT export_payload")
         .await?;
     let (entry, len) = if journal { (1, 9) } else { (0, 5) };
-    let result = tokio::time::timeout(
-        Duration::from_secs(30),
-        spool_source(
-            transaction,
-            schema,
-            row.get::<_, String>(entry).as_str(),
-            row.get(len),
-        ),
-    )
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        if journal && row.get::<_, String>(6) == "semantic_content" {
+            canonical::spool(
+                transaction,
+                schema,
+                &row.get::<_, String>(1),
+                &row.get::<_, String>(2),
+                &row.get::<_, String>(11),
+                &row.get::<_, String>(7),
+            )
+            .await
+        } else {
+            spool_source(
+                transaction,
+                schema,
+                row.get::<_, String>(entry).as_str(),
+                row.get(len),
+            )
+            .await
+        }
+    })
     .await
     .unwrap_or_else(|_| Err(anyhow::anyhow!("source materialization timed out")));
     if let Err(error) = &result {
@@ -421,11 +435,39 @@ async fn claim_journal(
     // Old-world events are retained for explicit retirement. Only supersede current
     // file work after its referenced revision is no longer the current entry.
     transaction.execute(&format!("UPDATE {s}.index_export_intents i SET status='dead',lease_token=NULL,lease_expires_at=NULL,last_error='source revision superseded',updated_at=clock_timestamp() WHERE i.incarnation=$1 AND i.source_config_version=$2 AND i.job_kind IN ('file_content','repair') AND i.status IN ('pending','uploading') AND NOT EXISTS(SELECT 1 FROM {s}.entries e WHERE e.entry_id=i.entry_id AND e.state_hash=i.source_state_hash AND e.content_hash=i.content_hash)"),&[&incarnation,&version]).await?;
+    transaction.execute(&format!("UPDATE {s}.index_export_intents i SET status='dead',lease_token=NULL,lease_expires_at=NULL,last_error='semantic target superseded',updated_at=clock_timestamp() \
+        WHERE i.incarnation=$1 AND i.source_config_version=$2 AND i.job_kind='semantic_content' AND i.status IN ('pending','uploading') \
+        AND (NOT EXISTS(SELECT 1 FROM {s}.entries e WHERE e.entry_id=i.entry_id AND e.state_hash=i.source_state_hash AND e.content_hash=i.content_hash) \
+          OR NOT EXISTS(SELECT 1 FROM {s}.file_semantic_state m WHERE m.entry_id=i.entry_id AND m.embedding_profile_id=i.embedding_profile_id \
+              AND m.desired_state_hash=i.source_state_hash AND m.desired_fingerprint=i.fingerprint))"), &[&incarnation,&version]).await?;
     let token = Uuid::new_v4().to_string();
-    // Unsupported job kinds stay pending and prevent a clean handoff; they must
-    // never be ACKed as a file task merely to make the drain count reach zero.
+    // Canonical work shares the same ordered queue and lease as raw files.
+    // The semantic desired identity must still match; lexical work may lag and
+    // keeps its obligation pending until the exact current sections are active.
     let sql = format!(
-        "WITH candidate AS (SELECT i.event_id FROM {s}.index_export_intents i JOIN {s}.entries e ON e.entry_id=i.entry_id AND e.state_hash=i.source_state_hash AND e.content_hash=i.content_hash JOIN {s}.file_contents f ON f.entry_id=e.entry_id WHERE i.incarnation=$1 AND i.source_config_version=$2 AND i.job_kind IN ('file_content','repair') AND i.lexical_profile_hash IS NOT NULL AND i.status IN ('pending','uploading') AND i.available_at<=clock_timestamp() AND (i.lease_expires_at IS NULL OR i.lease_expires_at<=clock_timestamp()) ORDER BY i.available_at,i.event_id FOR UPDATE OF i SKIP LOCKED LIMIT 1), claimed AS (UPDATE {s}.index_export_intents i SET status='uploading',attempts=attempts+1,lease_token=$3::text::uuid,lease_expires_at=clock_timestamp()+interval '2 minutes',updated_at=clock_timestamp() FROM candidate c WHERE i.event_id=c.event_id RETURNING i.*) SELECT c.event_id::text,c.entry_id::text,encode(c.source_state_hash,'hex'),encode(c.fingerprint,'hex'),c.incarnation,c.source_config_version,c.job_kind,encode(c.lexical_profile_hash,'hex'),c.media_type,octet_length(f.data),encode(c.content_hash,'hex') FROM claimed c JOIN {s}.file_contents f ON f.entry_id=c.entry_id"
+        "WITH candidate AS (SELECT i.event_id FROM {s}.index_export_intents i \
+        JOIN {s}.entries e ON e.entry_id=i.entry_id AND e.state_hash=i.source_state_hash AND e.content_hash=i.content_hash \
+        LEFT JOIN {s}.file_contents f ON f.entry_id=e.entry_id \
+        LEFT JOIN {s}.file_index_state l ON l.entry_id=e.entry_id \
+        WHERE i.incarnation=$1 AND i.source_config_version=$2 AND i.lexical_profile_hash IS NOT NULL \
+        AND ((i.job_kind IN ('file_content','repair') AND f.entry_id IS NOT NULL) \
+          OR (i.job_kind='semantic_content' AND l.active_state_hash=i.source_state_hash \
+              AND l.active_fingerprint=l.desired_fingerprint AND l.desired_state_hash=i.source_state_hash \
+              AND EXISTS(SELECT 1 FROM {s}.file_semantic_state m WHERE m.entry_id=i.entry_id \
+                  AND m.embedding_profile_id=i.embedding_profile_id AND m.desired_state_hash=i.source_state_hash \
+                  AND m.desired_fingerprint=i.fingerprint))) \
+        AND i.status IN ('pending','uploading') AND i.available_at<=clock_timestamp() \
+        AND (i.lease_expires_at IS NULL OR i.lease_expires_at<=clock_timestamp()) \
+        ORDER BY i.available_at,i.event_id FOR UPDATE OF i SKIP LOCKED LIMIT 1), \
+        claimed AS (UPDATE {s}.index_export_intents i SET status='uploading',attempts=attempts+1, \
+        lease_token=$3::text::uuid,lease_expires_at=clock_timestamp()+interval '2 minutes',updated_at=clock_timestamp() \
+        FROM candidate c WHERE i.event_id=c.event_id RETURNING i.*) \
+        SELECT c.event_id::text,c.entry_id::text,encode(c.source_state_hash,'hex'),encode(c.fingerprint,'hex'), \
+        c.incarnation,c.source_config_version,c.job_kind,encode(c.lexical_profile_hash,'hex'), \
+        CASE WHEN c.job_kind='semantic_content' THEN 'application/vnd.lakeon.canonical-sections+json;version=1' ELSE c.media_type END, \
+        coalesce(octet_length(f.data),0),encode(c.content_hash,'hex'),encode(l.active_fingerprint,'hex') \
+        FROM claimed c LEFT JOIN {s}.file_contents f ON f.entry_id=c.entry_id \
+        LEFT JOIN {s}.file_index_state l ON l.entry_id=c.entry_id"
     );
     let row = transaction
         .query_opt(&sql, &[&incarnation, &version, &token])
@@ -556,6 +598,18 @@ async fn retry_journal(
     Ok(())
 }
 
+fn input_kind(intent: &Intent) -> &'static str {
+    if intent
+        .event
+        .as_ref()
+        .is_some_and(|event| event.job_kind == "semantic_content")
+    {
+        "canonical_sections"
+    } else {
+        "raw_file"
+    }
+}
+
 async fn publish(
     s3: &aws_sdk_s3::Client,
     config: &Config,
@@ -573,7 +627,7 @@ async fn publish(
     let key = object_key(config, intent, source_id);
     let mut metadata = HashMap::new();
     metadata.insert("x-index-contract".into(), "document-object/v1".into());
-    metadata.insert("x-index-input-kind".into(), "raw_file".into());
+    metadata.insert("x-index-input-kind".into(), input_kind(intent).into());
     metadata.insert("x-index-media-type".into(), intent.media_type.clone());
     metadata.insert("x-index-payload-sha256".into(), checksum.clone());
     let encoded_revision = segment(intent.state_hash.clone());
@@ -681,7 +735,7 @@ async fn verify_version(
         || head.content_length() != Some(intent.payload.len as i64)
         || head.content_type() != Some(intent.media_type.as_str())
         || metadata.get("x-index-contract").map(String::as_str) != Some("document-object/v1")
-        || metadata.get("x-index-input-kind").map(String::as_str) != Some("raw_file")
+        || metadata.get("x-index-input-kind").map(String::as_str) != Some(input_kind(intent))
         || metadata.get("x-index-payload-sha256").map(String::as_str) != Some(checksum)
         || metadata.get("x-index-source-revision") != Some(&encoded_revision)
         || metadata.get("x-index-lexical-profile-hash") != Some(&intent.lexical_profile_hash)
@@ -834,6 +888,10 @@ fn required(name: &str) -> Result<String> {
 }
 
 #[cfg(test)]
+#[path = "index_exporter/canonical_tests.rs"]
+mod canonical_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     async fn test_spool(bytes: &[u8]) -> Spool {
@@ -847,7 +905,7 @@ mod tests {
         }
     }
 
-    struct TestPostgres(String);
+    pub(super) struct TestPostgres(pub(super) String);
     impl Drop for TestPostgres {
         fn drop(&mut self) {
             let _ = std::process::Command::new("docker")
@@ -855,7 +913,7 @@ mod tests {
                 .output();
         }
     }
-    async fn postgres() -> (TestPostgres, tokio_postgres::Client) {
+    pub(super) async fn postgres() -> (TestPostgres, tokio_postgres::Client) {
         let output = std::process::Command::new("docker")
             .args([
                 "run",
@@ -1206,7 +1264,7 @@ mod tests {
         );
     }
 
-    async fn journal_fixture(client: &tokio_postgres::Client) {
+    pub(super) async fn journal_fixture(client: &tokio_postgres::Client) {
         client
             .batch_execute("CREATE SCHEMA folder_v2; SET search_path=folder_v2,public;")
             .await
@@ -1219,6 +1277,10 @@ mod tests {
             INSERT INTO lbfs_runtime_fence VALUES(true,1,'RUNNING');
             CREATE TABLE entries(entry_id uuid PRIMARY KEY,state_hash bytea,content_hash bytea);
             CREATE TABLE file_contents(entry_id uuid PRIMARY KEY,data bytea);
+            CREATE TABLE file_index_state(entry_id uuid PRIMARY KEY,desired_state_hash bytea,
+                desired_fingerprint bytea,active_state_hash bytea,active_fingerprint bytea);
+            CREATE TABLE file_semantic_state(entry_id uuid,embedding_profile_id text,
+                desired_state_hash bytea,desired_fingerprint bytea,PRIMARY KEY(entry_id,embedding_profile_id));
             INSERT INTO entries VALUES('00000000-0000-0000-0000-000000000001',decode(repeat('11',32),'hex'),decode(repeat('44',32),'hex'));
             INSERT INTO file_contents VALUES('00000000-0000-0000-0000-000000000001',decode('6162','hex'));
             INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,media_type)
@@ -1426,8 +1488,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn lost_ack_reuses_exact_version_and_same_key_corruption_is_not_overwritten() {
+    pub(super) async fn minio() -> (TestPostgres, aws_sdk_s3::Client, Config) {
         let output = std::process::Command::new("docker")
             .args([
                 "run",
@@ -1506,6 +1567,12 @@ mod tests {
             .send()
             .await
             .unwrap();
+        (owned, s3, config)
+    }
+
+    #[tokio::test]
+    async fn lost_ack_reuses_exact_version_and_same_key_corruption_is_not_overwritten() {
+        let (_owned, s3, config) = minio().await;
         let intent = Intent {
             schema: "folder_a".into(),
             entry_id: Uuid::nil().to_string(),
