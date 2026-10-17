@@ -68,6 +68,89 @@ async fn native_fixture(client: &tokio_postgres::Client) -> Vec<String> {
 }
 
 #[tokio::test]
+async fn zero_occurrences_without_an_empty_current_source_preserve_pending_obligation() {
+    for mutation in [
+        "",
+        "DELETE FROM file_contents",
+        "UPDATE file_contents SET data=''::bytea",
+    ] {
+        let (_pg, mut client) = postgres().await;
+        fixture(&client).await;
+        client
+            .batch_execute("DELETE FROM section_occurrences")
+            .await
+            .unwrap();
+        client.batch_execute(mutation).await.unwrap();
+        let error = claim_journal(&mut client, "folder_v2", &config())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("proven empty current file"),
+            "{error:#}"
+        );
+        let row = client.query_one("SELECT status,object_version_id,lease_token::text,available_at>clock_timestamp() FROM index_export_intents",&[]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "pending");
+        assert!(row.get::<_, Option<String>>(1).is_none());
+        assert!(row.get::<_, Option<String>>(2).is_none());
+        assert!(row.get::<_, bool>(3));
+    }
+}
+
+#[tokio::test]
+async fn empty_file_canonical_exports_exact_version_and_acks_without_a_fake_section() {
+    let (_pg, mut client) = postgres().await;
+    fixture(&client).await;
+    client.batch_execute("DELETE FROM section_occurrences; UPDATE file_contents SET data=''::bytea; UPDATE entries SET content_hash=sha256(''::bytea); DELETE FROM index_export_intents; INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,embedding_profile_id,media_type) SELECT '00000000-0000-0000-0000-000000000042',entry_id,state_hash,decode(repeat('77',32),'hex'),1,1,'semantic_content',content_hash,decode(repeat('33',32),'hex'),'embed@1','text/markdown' FROM entries;").await.unwrap();
+    let (_obs, s3, mut config) = super::tests::minio().await;
+    config.journal = true;
+    let intent = claim_journal(&mut client, "folder_v2", &config)
+        .await
+        .unwrap()
+        .expect("a proven empty current lexical snapshot must be deliverable");
+    let receipt = publish(&s3, &config, &intent).await.unwrap();
+    let bytes = s3
+        .get_object()
+        .bucket(&config.bucket)
+        .key(&receipt.0)
+        .version_id(&receipt.1)
+        .send()
+        .await
+        .unwrap()
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["sections"], serde_json::json!([]));
+    assert_eq!(json["source_state_hash"], "11".repeat(32));
+    assert_eq!(json["lexical_fingerprint"], "55".repeat(32));
+    assert_eq!(publish(&s3, &config, &intent).await.unwrap(), receipt);
+    acknowledge(&mut client, &intent, &receipt.0, &receipt.1, &receipt.2)
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .query_one("SELECT status FROM index_export_intents", &[])
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "exported"
+    );
+    if let Ok(path) = std::env::var("LBFS_EXPORT_EMPTY_CANONICAL_PROOF_PATH") {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        output.write_all(&bytes).unwrap();
+    }
+}
+
+#[tokio::test]
 async fn semantic_exports_native_parser_section_identities_without_rewriting_them() {
     let (_owned, mut client) = postgres().await;
     fixture(&client).await;

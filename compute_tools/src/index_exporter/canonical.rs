@@ -98,8 +98,20 @@ pub(super) async fn spool(
         )
         .await?
         .get(0);
-    if !(1..=MAX_SECTIONS).contains(&count) {
-        bail!("canonical section count outside 1..100000");
+    if !(0..=MAX_SECTIONS).contains(&count) {
+        bail!("canonical section count outside 0..100000");
+    }
+    // Absence of occurrences alone is not proof of an empty document. Permit
+    // zero sections only for an exact current zero-byte source, including its
+    // content hash, inside the same repeatable-read snapshot as the lexical head.
+    if count == 0 {
+        let empty: bool = transaction.query_one(
+            &format!("SELECT EXISTS(SELECT 1 FROM {s}.entries e JOIN {s}.file_contents f USING(entry_id) WHERE e.entry_id=$1::text::uuid AND e.state_hash=decode($2,'hex') AND octet_length(f.data)=0 AND e.content_hash=sha256(f.data))"),
+            &[&entry, &state],
+        ).await?.get(0);
+        if !empty {
+            bail!("zero-section canonical input requires a proven empty current file");
+        }
     }
     let mut out = Writer {
         file: tokio::fs::File::from_std(tempfile::tempfile()?),
