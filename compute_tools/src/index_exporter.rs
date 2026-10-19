@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::compute::ComputeNode;
 
 mod canonical;
+mod deletion;
 mod record;
 
 #[derive(Clone)]
@@ -441,6 +442,10 @@ async fn claim_journal(
     {
         bail!("export assignment no longer matches current workspace/source configuration");
     }
+    if let Some(intent) = deletion::claim(&transaction, schema, incarnation, version).await? {
+        transaction.commit().await?;
+        return Ok(Some(intent));
+    }
     let records: bool = transaction
         .query_one(
             "SELECT to_regclass($1) IS NOT NULL",
@@ -622,6 +627,7 @@ fn input_kind(intent: &Intent) -> &'static str {
     match intent.event.as_ref().map(|e| e.job_kind.as_str()) {
         Some("semantic_content") => "canonical_sections",
         Some("record_content") => "canonical_record",
+        Some("tombstone") => "delete",
         _ => "raw_file",
     }
 }
@@ -1400,6 +1406,56 @@ mod tests {
         assert_eq!(rows[0].get::<_, String>(2), "dead");
         assert_eq!(rows[1].get::<_, String>(2), "pending");
         assert_eq!(rows[2].get::<_, String>(2), "pending");
+    }
+
+    #[tokio::test]
+    async fn deleted_entry_exports_exact_tombstone_without_live_relations_or_fake_profile() {
+        let (_owned, mut client) = postgres().await;
+        journal_fixture(&client).await;
+        client.batch_execute("DELETE FROM index_export_intents; DELETE FROM entries; DROP TABLE file_contents,file_index_state,file_semantic_state; INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind) VALUES ('00000000-0000-0000-0000-000000000051','00000000-0000-0000-0000-000000000001',decode(repeat('11',32),'hex'),decode(repeat('22',32),'hex'),1,1,'tombstone');").await.unwrap();
+        let (_obs, s3, mut config) = minio().await;
+        config.journal = true;
+        let intent = claim_journal(&mut client, "folder_v2", &config)
+            .await
+            .unwrap()
+            .expect("deleted source must remain deliverable without file tables");
+        assert_eq!(input_kind(&intent), "delete");
+        let receipt = publish(&s3, &config, &intent).await.unwrap();
+        assert_eq!(publish(&s3, &config, &intent).await.unwrap(), receipt);
+        let object = s3
+            .get_object()
+            .bucket(&config.bucket)
+            .key(&receipt.0)
+            .version_id(&receipt.1)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            !object
+                .metadata()
+                .unwrap()
+                .contains_key("x-index-lexical-profile-hash")
+        );
+        let bytes = object.body.collect().await.unwrap().into_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["schema"], "canonical-delete/v1");
+        assert_eq!(body["event_id"], "00000000-0000-0000-0000-000000000051");
+        assert_eq!(body["source_state_hash"], "11".repeat(32));
+        assert_eq!(body["fingerprint"], "22".repeat(32));
+        acknowledge(&mut client, &intent, &receipt.0, &receipt.1, &receipt.2)
+            .await
+            .unwrap();
+        if let Ok(path) = std::env::var("LBFS_EXPORT_DELETE_PROOF_PATH") {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut out = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap();
+            out.write_all(&bytes).unwrap();
+        }
     }
 
     #[tokio::test]
