@@ -423,7 +423,7 @@ async fn claim_journal(
     let s = quote(schema);
     // Old-world events are retained for explicit retirement. Only supersede current
     // file work after its referenced revision is no longer the current entry.
-    transaction.execute(&format!("UPDATE {s}.index_export_intents i SET status='dead',lease_token=NULL,lease_expires_at=NULL,last_error='source revision superseded',updated_at=clock_timestamp() WHERE i.incarnation=$1 AND i.source_config_version=$2 AND i.job_kind IN ('file_content','repair') AND i.status IN ('pending','uploading') AND NOT EXISTS(SELECT 1 FROM {s}.entries e WHERE e.entry_id=i.entry_id AND e.state_hash=i.source_state_hash AND e.content_hash=i.content_hash)"),&[&incarnation,&version]).await?;
+    transaction.execute(&format!("UPDATE {s}.index_export_intents i SET status='dead',lease_token=NULL,lease_expires_at=NULL,last_error='source revision superseded',updated_at=clock_timestamp() WHERE i.incarnation=$1 AND i.source_config_version=$2 AND i.job_kind IN ('file_content','repair') AND i.status IN ('pending','uploading') AND NOT EXISTS(SELECT 1 FROM {s}.entries e JOIN {s}.file_index_state l ON l.entry_id=e.entry_id WHERE e.entry_id=i.entry_id AND e.state_hash=i.source_state_hash AND e.content_hash=i.content_hash AND l.desired_state_hash=i.source_state_hash AND l.desired_fingerprint=i.fingerprint)"),&[&incarnation,&version]).await?;
     transaction.execute(&format!("UPDATE {s}.index_export_intents i SET status='dead',lease_token=NULL,lease_expires_at=NULL,last_error='semantic target superseded',updated_at=clock_timestamp() \
         WHERE i.incarnation=$1 AND i.source_config_version=$2 AND i.job_kind='semantic_content' AND i.status IN ('pending','uploading') \
         AND (NOT EXISTS(SELECT 1 FROM {s}.entries e WHERE e.entry_id=i.entry_id AND e.state_hash=i.source_state_hash AND e.content_hash=i.content_hash) \
@@ -439,7 +439,7 @@ async fn claim_journal(
         LEFT JOIN {s}.file_contents f ON f.entry_id=e.entry_id \
         LEFT JOIN {s}.file_index_state l ON l.entry_id=e.entry_id \
         WHERE i.incarnation=$1 AND i.source_config_version=$2 AND i.lexical_profile_hash IS NOT NULL \
-        AND ((i.job_kind IN ('file_content','repair') AND f.entry_id IS NOT NULL AND (i.media_type <> 'text/markdown' OR (l.active_state_hash=i.source_state_hash AND l.desired_state_hash=i.source_state_hash AND l.active_fingerprint=i.fingerprint AND l.desired_fingerprint=i.fingerprint AND l.active_section_count IS NOT NULL))) \
+        AND ((i.job_kind IN ('file_content','repair') AND f.entry_id IS NOT NULL AND l.desired_state_hash=i.source_state_hash AND l.desired_fingerprint=i.fingerprint AND (i.media_type <> 'text/markdown' OR (l.active_state_hash=i.source_state_hash AND l.desired_state_hash=i.source_state_hash AND l.active_fingerprint=i.fingerprint AND l.desired_fingerprint=i.fingerprint AND l.active_section_count IS NOT NULL))) \
           OR (i.job_kind='semantic_content' AND l.active_state_hash=i.source_state_hash \
               AND l.active_fingerprint=l.desired_fingerprint AND l.desired_state_hash=i.source_state_hash \
               AND EXISTS(SELECT 1 FROM {s}.file_semantic_state m WHERE m.entry_id=i.entry_id \
@@ -1139,6 +1139,7 @@ mod tests {
         client.batch_execute("UPDATE folder_a.file_contents SET data=convert_to(repeat('x',67108865),'UTF8');
             INSERT INTO folder_a.entries VALUES('00000000-0000-0000-0000-000000000002',decode(repeat('22',32),'hex'),sha256(decode('6162','hex')));
             INSERT INTO folder_a.file_contents VALUES('00000000-0000-0000-0000-000000000002',decode('6162','hex'));
+            INSERT INTO folder_a.file_index_state SELECT entry_id,state_hash,decode(repeat('22',32),'hex'),NULL,NULL,NULL FROM folder_a.entries WHERE entry_id='00000000-0000-0000-0000-000000000002';
             INSERT INTO folder_a.index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,media_type,status)
             VALUES('00000000-0000-0000-0000-000000000012','00000000-0000-0000-0000-000000000002',decode(repeat('22',32),'hex'),decode(repeat('22',32),'hex'),1,1,'file_content',sha256(decode('6162','hex')),decode(repeat('33',32),'hex'),'application/pdf','pending');").await.unwrap();
         assert!(claim(&mut client, "folder_a").await.is_err());
@@ -1230,6 +1231,7 @@ mod tests {
                 desired_state_hash bytea,desired_fingerprint bytea,PRIMARY KEY(entry_id,embedding_profile_id));
             INSERT INTO entries VALUES('00000000-0000-0000-0000-000000000001',decode(repeat('11',32),'hex'),decode(repeat('44',32),'hex'));
             INSERT INTO file_contents VALUES('00000000-0000-0000-0000-000000000001',decode('6162','hex'));
+            INSERT INTO file_index_state SELECT entry_id,state_hash,decode(repeat('22',32),'hex'),NULL,NULL,NULL FROM entries;
             INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,media_type)
             VALUES('00000000-0000-0000-0000-000000000011','00000000-0000-0000-0000-000000000001',decode(repeat('11',32),'hex'),decode(repeat('22',32),'hex'),1,1,'file_content',decode(repeat('44',32),'hex'),decode(repeat('33',32),'hex'),'application/pdf');").await.unwrap();
     }

@@ -20,6 +20,7 @@ async fn fixture(client: &tokio_postgres::Client) {
     journal_fixture(client).await;
     client.batch_execute(r#"
         DELETE FROM index_export_intents;
+        DELETE FROM file_index_state;
         CREATE TABLE section_occurrences(entry_id uuid,ordinal int,source_state_hash bytea,
             section_content_hash bytea,line_start int,line_end int,PRIMARY KEY(entry_id,ordinal));
         CREATE TABLE section_contents(section_content_hash bytea,lexical_profile_hash bytea,
@@ -592,4 +593,21 @@ async fn supersession_does_not_retire_other_incarnations_or_source_configuration
             .collect::<Vec<_>>(),
         vec!["dead", "pending", "pending"]
     );
+}
+
+#[tokio::test]
+async fn changed_lexical_fingerprint_retires_unexported_same_revision_obligations() {
+    let (_owned, mut client) = postgres().await;
+    fixture(&client).await;
+    client.batch_execute("DELETE FROM index_export_intents; INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,media_type) SELECT '00000000-0000-0000-0000-000000000063',entry_id,state_hash,decode(repeat('44',32),'hex'),1,1,'file_content',content_hash,decode(repeat('33',32),'hex'),'text/markdown' FROM entries").await.unwrap();
+    assert!(claim_journal(&mut client, "folder_v2", &config())
+        .await
+        .unwrap()
+        .is_none());
+    let status: String = client
+        .query_one("SELECT status FROM index_export_intents", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(status, "dead");
 }
