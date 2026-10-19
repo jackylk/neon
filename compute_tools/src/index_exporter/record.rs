@@ -51,6 +51,7 @@ pub(super) async fn spool(
         file,
         len: bytes.len(),
         checksum: hex::encode(Sha256::digest(&bytes)),
+        source_content_hash: None,
     })
 }
 

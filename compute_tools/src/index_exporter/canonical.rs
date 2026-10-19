@@ -112,7 +112,7 @@ pub(super) async fn spool(
     }
     if count == 0 {
         let valid: bool = transaction.query_one(
-            &format!("SELECT EXISTS(SELECT 1 FROM {s}.entries e JOIN {s}.file_contents f USING(entry_id) WHERE e.entry_id=$1::text::uuid AND e.state_hash=decode($2,'hex') AND octet_length(f.data)<=$3 AND e.content_hash=sha256(f.data))"),
+            &format!("SELECT EXISTS(SELECT 1 FROM {s}.entries e JOIN {s}.file_contents f USING(entry_id) WHERE e.entry_id=$1::text::uuid AND e.state_hash=decode($2,'hex') AND octet_length(f.data)<=$3 AND e.content_hash=sha256(int4send(14)||convert_to('lbfs:inline:v1','UTF8')||f.data))"),
             &[&entry,&state,&(MAX_FILE_BYTES as i32)],
         ).await?.get(0);
         if !valid {
@@ -201,5 +201,6 @@ pub(super) async fn spool(
         file: out.file,
         len: out.len,
         checksum: hex::encode(out.hash.finalize()),
+        source_content_hash: None,
     })
 }

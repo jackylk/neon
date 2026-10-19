@@ -50,6 +50,7 @@ pub(super) async fn claim(
             file,
             len: bytes.len(),
             checksum: hex::encode(Sha256::digest(&bytes)),
+            source_content_hash: None,
         },
         lease_owner: token,
         event: EventIdentity {

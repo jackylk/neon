@@ -49,6 +49,7 @@ struct Intent {
 // schema force unbounded disk/memory use in the exporter.
 const MAX_FILE_BYTES: usize = 67_108_864;
 const SOURCE_CHUNK_BYTES: usize = 1_048_576;
+const INLINE_CONTENT_DOMAIN: &[u8] = b"lbfs:inline:v1";
 
 #[derive(Debug)]
 struct Spool {
@@ -56,6 +57,8 @@ struct Spool {
     file: tokio::fs::File,
     len: usize,
     checksum: String,
+    // Native file identity is distinct from the OBS payload checksum.
+    source_content_hash: Option<String>,
 }
 
 impl Spool {
@@ -87,6 +90,9 @@ async fn spool_source(
     }
     let mut file = tokio::fs::File::from_std(tempfile::tempfile()?);
     let mut hash = Sha256::new();
+    let mut content = Sha256::new();
+    content.update((INLINE_CONTENT_DOMAIN.len() as i32).to_be_bytes());
+    content.update(INLINE_CONTENT_DOMAIN);
     let sql = format!(
         "SELECT substring(data from $2 for $3) FROM {}.file_contents WHERE entry_id=$1::text::uuid",
         quote(schema)
@@ -102,6 +108,7 @@ async fn spool_source(
             bail!("source changed size while materializing export input");
         }
         hash.update(&chunk);
+        content.update(&chunk);
         file.write_all(&chunk).await?;
         offset += count;
     }
@@ -110,6 +117,7 @@ async fn spool_source(
         file,
         len,
         checksum: hex::encode(hash.finalize()),
+        source_content_hash: Some(hex::encode(content.finalize())),
     })
 }
 
@@ -601,7 +609,9 @@ async fn publish(
 ) -> Result<(String, String, String)> {
     let checksum = intent.payload.checksum.clone();
     let event = &intent.event;
-    if input_kind(intent) == "raw_file" && event.content_hash != checksum {
+    if input_kind(intent) == "raw_file"
+        && intent.payload.source_content_hash.as_deref() != Some(event.content_hash.as_str())
+    {
         bail!("source content checksum does not match committed export intent");
     }
     let source_id = source_id(config, intent);
@@ -818,6 +828,13 @@ mod canonical_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn native_content_hash(bytes: &[u8]) -> String {
+        let mut hash = Sha256::new();
+        hash.update(14i32.to_be_bytes());
+        hash.update(b"lbfs:inline:v1");
+        hash.update(bytes);
+        hex::encode(hash.finalize())
+    }
     async fn test_spool(bytes: &[u8]) -> Spool {
         let mut file = tokio::fs::File::from_std(tempfile::tempfile().unwrap());
         file.write_all(bytes).await.unwrap();
@@ -826,6 +843,7 @@ mod tests {
             file,
             len: bytes.len(),
             checksum: hex::encode(Sha256::digest(bytes)),
+            source_content_hash: Some(native_content_hash(bytes)),
         }
     }
 
@@ -891,7 +909,7 @@ mod tests {
     }
     async fn file_fixture_schema(client: &tokio_postgres::Client, schema: &str) {
         journal_fixture(client).await;
-        client.batch_execute(&format!("ALTER SCHEMA folder_v2 RENAME TO {}; SET search_path={},public; DELETE FROM index_export_intents; UPDATE entries SET content_hash=(SELECT sha256(data) FROM file_contents LIMIT 1); INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,media_type) SELECT '00000000-0000-0000-0000-000000000011',entry_id,state_hash,decode(repeat('22',32),'hex'),1,1,'file_content',content_hash,decode(repeat('33',32),'hex'),'application/pdf' FROM entries;",quote(schema),quote(schema))).await.unwrap();
+        client.batch_execute(&format!("ALTER SCHEMA folder_v2 RENAME TO {}; SET search_path={},public; DELETE FROM index_export_intents; UPDATE entries SET content_hash=(SELECT sha256(int4send(14)||convert_to('lbfs:inline:v1','UTF8')||data) FROM file_contents LIMIT 1); INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,media_type) SELECT '00000000-0000-0000-0000-000000000011',entry_id,state_hash,decode(repeat('22',32),'hex'),1,1,'file_content',content_hash,decode(repeat('33',32),'hex'),'application/pdf' FROM entries;",quote(schema),quote(schema))).await.unwrap();
     }
     async fn claim(client: &mut tokio_postgres::Client, schema: &str) -> Result<Option<Intent>> {
         let config = Config {
@@ -985,6 +1003,8 @@ mod tests {
             spool.checksum,
             "1b52fa3b6401c1f3c3d16e0a8d30e4b038a84a8ae0966c955a1cc04272c00118"
         );
+        assert_eq!(spool.source_content_hash.as_deref(), Some(native_content_hash("ab".repeat(1048583).as_bytes()).as_str()));
+        assert_ne!(spool.source_content_hash.as_deref(), Some(spool.checksum.as_str()));
         let metadata = spool.file.metadata().await.unwrap();
         assert_eq!(metadata.len(), 2097166);
         assert_eq!(
@@ -1137,11 +1157,11 @@ mod tests {
         let (_owned, mut client) = postgres().await;
         file_fixture(&client).await;
         client.batch_execute("UPDATE folder_a.file_contents SET data=convert_to(repeat('x',67108865),'UTF8');
-            INSERT INTO folder_a.entries VALUES('00000000-0000-0000-0000-000000000002',decode(repeat('22',32),'hex'),sha256(decode('6162','hex')));
+            INSERT INTO folder_a.entries VALUES('00000000-0000-0000-0000-000000000002',decode(repeat('22',32),'hex'),sha256(int4send(14)||convert_to('lbfs:inline:v1','UTF8')||decode('6162','hex')));
             INSERT INTO folder_a.file_contents VALUES('00000000-0000-0000-0000-000000000002',decode('6162','hex'));
             INSERT INTO folder_a.file_index_state SELECT entry_id,state_hash,decode(repeat('22',32),'hex'),NULL,NULL,NULL FROM folder_a.entries WHERE entry_id='00000000-0000-0000-0000-000000000002';
             INSERT INTO folder_a.index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,media_type,status)
-            VALUES('00000000-0000-0000-0000-000000000012','00000000-0000-0000-0000-000000000002',decode(repeat('22',32),'hex'),decode(repeat('22',32),'hex'),1,1,'file_content',sha256(decode('6162','hex')),decode(repeat('33',32),'hex'),'application/pdf','pending');").await.unwrap();
+            VALUES('00000000-0000-0000-0000-000000000012','00000000-0000-0000-0000-000000000002',decode(repeat('22',32),'hex'),decode(repeat('22',32),'hex'),1,1,'file_content',sha256(int4send(14)||convert_to('lbfs:inline:v1','UTF8')||decode('6162','hex')),decode(repeat('33',32),'hex'),'application/pdf','pending');").await.unwrap();
         assert!(claim(&mut client, "folder_a").await.is_err());
         let next = claim(&mut client, "folder_a")
             .await
@@ -1725,7 +1745,7 @@ mod tests {
                 incarnation: 1,
                 source_config_version: 1,
                 job_kind: "file_content".into(),
-                content_hash: hex::encode(Sha256::digest(b"hello")),
+                content_hash: native_content_hash(b"hello"),
             },
         };
         let first = publish(&s3, &config, &intent).await.unwrap();
@@ -1813,7 +1833,7 @@ mod tests {
             )
             .await
             .unwrap();
-        client.batch_execute("DELETE FROM folder_a.index_export_intents; UPDATE folder_a.entries SET content_hash=(SELECT sha256(data) FROM folder_a.file_contents LIMIT 1); INSERT INTO folder_a.index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,media_type) SELECT '00000000-0000-0000-0000-000000000011',entry_id,state_hash,decode(repeat('22',32),'hex'),1,1,'file_content',content_hash,decode(repeat('33',32),'hex'),'application/pdf' FROM folder_a.entries;").await.unwrap();
+        client.batch_execute("DELETE FROM folder_a.index_export_intents; UPDATE folder_a.entries SET content_hash=(SELECT sha256(int4send(14)||convert_to('lbfs:inline:v1','UTF8')||data) FROM folder_a.file_contents LIMIT 1); INSERT INTO folder_a.index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,media_type) SELECT '00000000-0000-0000-0000-000000000011',entry_id,state_hash,decode(repeat('22',32),'hex'),1,1,'file_content',content_hash,decode(repeat('33',32),'hex'),'application/pdf' FROM folder_a.entries;").await.unwrap();
         let large = claim(&mut client, "folder_a").await.unwrap().unwrap();
         assert_eq!(large.payload.len, 2097166);
         let uploaded = publish(&s3, &config, &large).await.unwrap();
@@ -1898,7 +1918,7 @@ mod tests {
                 incarnation: 7,
                 source_config_version: 1,
                 job_kind: "file_content".into(),
-                content_hash: hex::encode(Sha256::digest(b"")),
+                content_hash: native_content_hash(b""),
             },
         };
         assert!(object_key(&config, &intent, source).starts_with("index/v1/inputs/"));

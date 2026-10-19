@@ -97,10 +97,22 @@ async fn zero_occurrences_without_an_empty_current_source_preserve_pending_oblig
 }
 
 #[tokio::test]
+async fn zero_section_proof_refuses_bytes_that_disagree_with_native_content_identity() {
+    let (_pg, mut client) = postgres().await;
+    fixture(&client).await;
+    client.batch_execute("UPDATE file_index_state SET active_section_count=0; DELETE FROM section_occurrences; UPDATE entries SET content_hash=(SELECT sha256(int4send(14)||convert_to('lbfs:inline:v1','UTF8')||data) FROM file_contents LIMIT 1); DELETE FROM index_export_intents; INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,embedding_profile_id,media_type) SELECT gen_random_uuid(),entry_id,state_hash,decode(repeat('77',32),'hex'),1,1,'semantic_content',content_hash,decode(repeat('33',32),'hex'),'embed@1','text/markdown' FROM entries; UPDATE file_contents SET data=''::bytea;").await.unwrap();
+    let error = claim_journal(&mut client, "folder_v2", &config()).await.unwrap_err();
+    assert!(error.to_string().contains("verified current source"), "{error:#}");
+    let row=client.query_one("SELECT status,object_version_id FROM index_export_intents",&[]).await.unwrap();
+    assert_eq!(row.get::<_,String>(0), "pending");
+    assert!(row.get::<_,Option<String>>(1).is_none());
+}
+
+#[tokio::test]
 async fn native_markdown_content_exports_the_completed_zero_section_head() {
     let (_pg, mut client) = postgres().await;
     fixture(&client).await;
-    client.batch_execute("UPDATE file_index_state SET active_section_count=0; DELETE FROM section_occurrences; UPDATE file_contents SET data='  \n\t'::bytea; UPDATE entries SET content_hash=(SELECT sha256(data) FROM file_contents LIMIT 1); DELETE FROM index_export_intents; INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,media_type) SELECT '00000000-0000-0000-0000-000000000062',entry_id,state_hash,decode(repeat('55',32),'hex'),1,1,'file_content',content_hash,decode(repeat('33',32),'hex'),'text/markdown' FROM entries;").await.unwrap();
+    client.batch_execute("UPDATE file_index_state SET active_section_count=0; DELETE FROM section_occurrences; UPDATE file_contents SET data='  \n\t'::bytea; UPDATE entries SET content_hash=(SELECT sha256(int4send(14)||convert_to('lbfs:inline:v1','UTF8')||data) FROM file_contents LIMIT 1); DELETE FROM index_export_intents; INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,media_type) SELECT '00000000-0000-0000-0000-000000000062',entry_id,state_hash,decode(repeat('55',32),'hex'),1,1,'file_content',content_hash,decode(repeat('33',32),'hex'),'text/markdown' FROM entries;").await.unwrap();
     let intent = claim_journal(&mut client, "folder_v2", &config())
         .await
         .unwrap()
@@ -123,7 +135,7 @@ async fn native_markdown_content_exports_the_completed_zero_section_head() {
 async fn nonempty_zero_section_head_with_durable_count_exports_without_fake_sections() {
     let (_pg, mut client) = postgres().await;
     fixture(&client).await;
-    client.batch_execute("UPDATE file_index_state SET active_section_count=0; DELETE FROM section_occurrences; UPDATE file_contents SET data='  \n\t'::bytea; UPDATE entries SET content_hash=(SELECT sha256(data) FROM file_contents LIMIT 1); DELETE FROM index_export_intents; INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,embedding_profile_id,media_type) SELECT '00000000-0000-0000-0000-000000000052',entry_id,state_hash,decode(repeat('77',32),'hex'),1,1,'semantic_content',content_hash,decode(repeat('33',32),'hex'),'embed@1','text/markdown' FROM entries;").await.unwrap();
+    client.batch_execute("UPDATE file_index_state SET active_section_count=0; DELETE FROM section_occurrences; UPDATE file_contents SET data='  \n\t'::bytea; UPDATE entries SET content_hash=(SELECT sha256(int4send(14)||convert_to('lbfs:inline:v1','UTF8')||data) FROM file_contents LIMIT 1); DELETE FROM index_export_intents; INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,embedding_profile_id,media_type) SELECT '00000000-0000-0000-0000-000000000052',entry_id,state_hash,decode(repeat('77',32),'hex'),1,1,'semantic_content',content_hash,decode(repeat('33',32),'hex'),'embed@1','text/markdown' FROM entries;").await.unwrap();
     let intent = claim_journal(&mut client, "folder_v2", &config())
         .await
         .unwrap()
@@ -146,7 +158,7 @@ async fn nonempty_zero_section_head_with_durable_count_exports_without_fake_sect
 async fn empty_file_canonical_exports_exact_version_and_acks_without_a_fake_section() {
     let (_pg, mut client) = postgres().await;
     fixture(&client).await;
-    client.batch_execute("UPDATE file_index_state SET active_section_count=0; DELETE FROM section_occurrences; UPDATE file_contents SET data=''::bytea; UPDATE entries SET content_hash=sha256(''::bytea); DELETE FROM index_export_intents; INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,embedding_profile_id,media_type) SELECT '00000000-0000-0000-0000-000000000042',entry_id,state_hash,decode(repeat('77',32),'hex'),1,1,'semantic_content',content_hash,decode(repeat('33',32),'hex'),'embed@1','text/markdown' FROM entries;").await.unwrap();
+    client.batch_execute("UPDATE file_index_state SET active_section_count=0; DELETE FROM section_occurrences; UPDATE file_contents SET data=''::bytea; UPDATE entries SET content_hash=sha256(int4send(14)||convert_to('lbfs:inline:v1','UTF8')||''::bytea); DELETE FROM index_export_intents; INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,embedding_profile_id,media_type) SELECT '00000000-0000-0000-0000-000000000042',entry_id,state_hash,decode(repeat('77',32),'hex'),1,1,'semantic_content',content_hash,decode(repeat('33',32),'hex'),'embed@1','text/markdown' FROM entries;").await.unwrap();
     let (_obs, s3, config) = super::tests::minio().await;
 
     let intent = claim_journal(&mut client, "folder_v2", &config)
