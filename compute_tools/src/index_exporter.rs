@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::compute::ComputeNode;
 
 mod canonical;
+mod record;
 
 #[derive(Clone)]
 struct Config {
@@ -215,7 +216,16 @@ async fn spool_claim(
         .await?;
     let (entry, len) = if journal { (1, 9) } else { (0, 5) };
     let result = tokio::time::timeout(Duration::from_secs(30), async {
-        if journal && row.get::<_, String>(6) == "semantic_content" {
+        if journal && row.get::<_, String>(6) == "record_content" {
+            record::spool(
+                transaction,
+                schema,
+                &row.get::<_, String>(1),
+                &row.get::<_, String>(2),
+                &row.get::<_, String>(10),
+            )
+            .await
+        } else if journal && row.get::<_, String>(6) == "semantic_content" {
             canonical::spool(
                 transaction,
                 schema,
@@ -431,6 +441,16 @@ async fn claim_journal(
     {
         bail!("export assignment no longer matches current workspace/source configuration");
     }
+    let records: bool = transaction
+        .query_one(
+            "SELECT to_regclass($1) IS NOT NULL",
+            &[&format!("{}.session_records", quote(schema))],
+        )
+        .await?
+        .get(0);
+    if records {
+        return record::claim(transaction, schema, incarnation, version).await;
+    }
     let s = quote(schema);
     // Old-world events are retained for explicit retirement. Only supersede current
     // file work after its referenced revision is no longer the current entry.
@@ -599,14 +619,10 @@ async fn retry_journal(
 }
 
 fn input_kind(intent: &Intent) -> &'static str {
-    if intent
-        .event
-        .as_ref()
-        .is_some_and(|event| event.job_kind == "semantic_content")
-    {
-        "canonical_sections"
-    } else {
-        "raw_file"
+    match intent.event.as_ref().map(|e| e.job_kind.as_str()) {
+        Some("semantic_content") => "canonical_sections",
+        Some("record_content") => "canonical_record",
+        _ => "raw_file",
     }
 }
 
@@ -632,10 +648,12 @@ async fn publish(
     metadata.insert("x-index-payload-sha256".into(), checksum.clone());
     let encoded_revision = segment(intent.state_hash.clone());
     metadata.insert("x-index-source-revision".into(), encoded_revision.clone());
-    metadata.insert(
-        "x-index-lexical-profile-hash".into(),
-        intent.lexical_profile_hash.clone(),
-    );
+    if !intent.lexical_profile_hash.is_empty() {
+        metadata.insert(
+            "x-index-lexical-profile-hash".into(),
+            intent.lexical_profile_hash.clone(),
+        );
+    }
     metadata.insert("x-index-created-at".into(), created_at());
     // Reconcile a completed PUT whose ACK/response was lost. A deterministic key
     // is immutable: a conflicting object is evidence to retain, never overwrite.
@@ -738,7 +756,8 @@ async fn verify_version(
         || metadata.get("x-index-input-kind").map(String::as_str) != Some(input_kind(intent))
         || metadata.get("x-index-payload-sha256").map(String::as_str) != Some(checksum)
         || metadata.get("x-index-source-revision") != Some(&encoded_revision)
-        || metadata.get("x-index-lexical-profile-hash") != Some(&intent.lexical_profile_hash)
+        || metadata.get("x-index-lexical-profile-hash")
+            != (!intent.lexical_profile_hash.is_empty()).then_some(&intent.lexical_profile_hash)
     {
         bail!("OBS immutable object metadata verification failed");
     }
@@ -1285,6 +1304,158 @@ mod tests {
             INSERT INTO file_contents VALUES('00000000-0000-0000-0000-000000000001',decode('6162','hex'));
             INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,media_type)
             VALUES('00000000-0000-0000-0000-000000000011','00000000-0000-0000-0000-000000000001',decode(repeat('11',32),'hex'),decode(repeat('22',32),'hex'),1,1,'file_content',decode(repeat('44',32),'hex'),decode(repeat('33',32),'hex'),'text/markdown');").await.unwrap();
+    }
+
+    async fn record_fixture(client: &tokio_postgres::Client) {
+        journal_fixture(client).await;
+        client.batch_execute("DELETE FROM index_export_intents; DROP TABLE file_contents,file_index_state,file_semantic_state; CREATE TABLE session_records(entry_id uuid,seq bigint,record_id uuid,line_no bigint,byte_start bigint,byte_end bigint,raw_line bytea,record_hash bytea,prefix_state_hash bytea,text text,PRIMARY KEY(entry_id,seq));
+          INSERT INTO session_records SELECT entry_id,1,'00000000-0000-0000-0000-000000000043',1,0,20,convert_to('record sentinel 雪'||chr(10),'UTF8'),sha256(int4send(21)||convert_to('lbfs-append-record-v1','UTF8')||int8send(20)||convert_to('record sentinel 雪'||chr(10),'UTF8')),decode(repeat('11',32),'hex'),'record sentinel 雪' FROM entries;
+          UPDATE entries SET state_hash=decode(repeat('99',32),'hex');
+          INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,media_type)
+          SELECT '00000000-0000-0000-0000-000000000044',entry_id,prefix_state_hash,record_hash,1,1,'record_content',record_hash,'application/x-ndjson' FROM session_records;").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_projected_record_exports_without_fake_text() {
+        let (_owned, mut client) = postgres().await;
+        record_fixture(&client).await;
+        client.batch_execute("UPDATE session_records SET raw_line=decode('0a','hex'),text='',byte_end=1,record_hash=sha256(int4send(21)||convert_to('lbfs-append-record-v1','UTF8')||int8send(1)||decode('0a','hex')); DELETE FROM index_export_intents; INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,media_type) SELECT gen_random_uuid(),entry_id,prefix_state_hash,record_hash,1,1,'record_content',record_hash,'application/x-ndjson' FROM session_records;").await.unwrap();
+        let (_obs, s3, mut config) = minio().await;
+        config.journal = true;
+        let intent = claim_journal(&mut client, "folder_v2", &config)
+            .await
+            .unwrap()
+            .unwrap();
+        let receipt = publish(&s3, &config, &intent).await.unwrap();
+        let object = s3
+            .get_object()
+            .bucket(&config.bucket)
+            .key(&receipt.0)
+            .version_id(&receipt.1)
+            .send()
+            .await
+            .unwrap();
+        let bytes = object.body.collect().await.unwrap().into_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["text"], "");
+        assert_eq!(body["byte_end"], 1);
+        acknowledge(&mut client, &intent, &receipt.0, &receipt.1, &receipt.2)
+            .await
+            .unwrap();
+        if let Ok(path) = std::env::var("LBFS_EXPORT_EMPTY_RECORD_PROOF_PATH") {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut output = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap();
+            output.write_all(&bytes).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn record_corruption_is_retried_and_missing_records_retire_only_current_scope() {
+        let (_owned, mut client) = postgres().await;
+        record_fixture(&client).await;
+        let config = Config {
+            database_name: "test".into(),
+            tenant_id: "test".into(),
+            namespace_id: "lakebasefs".into(),
+            source_generation: 1,
+            source_config_version: 1,
+            journal: true,
+            endpoint: "test".into(),
+            region: "test".into(),
+            bucket: "test".into(),
+        };
+        for mutation in [
+            "UPDATE session_records SET raw_line=convert_to('tampered','UTF8')",
+            "UPDATE session_records SET raw_line=convert_to(repeat('x',1048577),'UTF8')",
+            "UPDATE session_records SET text=repeat('x',1048577)",
+        ] {
+            client.batch_execute("UPDATE session_records SET raw_line=convert_to('record sentinel 雪'||chr(10),'UTF8'),text='record sentinel 雪'").await.unwrap();
+            client.batch_execute(mutation).await.unwrap();
+            client.batch_execute("UPDATE index_export_intents SET available_at=clock_timestamp()-interval '1 second'").await.unwrap();
+            assert!(
+                claim_journal(&mut client, "folder_v2", &config)
+                    .await
+                    .is_err()
+            );
+            let row=client.query_one("SELECT status,lease_token IS NULL,available_at>clock_timestamp() FROM index_export_intents",&[]).await.unwrap();
+            assert_eq!(row.get::<_, String>(0), "pending");
+            assert!(row.get::<_, bool>(1));
+            assert!(row.get::<_, bool>(2));
+        }
+        client.batch_execute("INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,media_type) SELECT gen_random_uuid(),entry_id,source_state_hash,fingerprint,2,1,job_kind,content_hash,media_type FROM index_export_intents; INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,media_type) SELECT gen_random_uuid(),entry_id,source_state_hash,fingerprint,1,2,job_kind,content_hash,media_type FROM index_export_intents WHERE incarnation=1; DELETE FROM session_records;").await.unwrap();
+        assert!(
+            claim_journal(&mut client, "folder_v2", &config)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let rows=client.query("SELECT incarnation,source_config_version,status FROM index_export_intents ORDER BY incarnation,source_config_version",&[]).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].get::<_, String>(2), "dead");
+        assert_eq!(rows[1].get::<_, String>(2), "pending");
+        assert_eq!(rows[2].get::<_, String>(2), "pending");
+    }
+
+    #[tokio::test]
+    async fn record_intent_survives_later_appends_and_exports_without_file_relations() {
+        let (_owned, mut client) = postgres().await;
+        record_fixture(&client).await;
+        let (_obs, s3, mut config) = minio().await;
+        config.journal = true;
+        let intent=claim_journal(&mut client,"folder_v2",&config).await.unwrap().expect("retained record prefix must export without file tables or a lexical section profile");
+        let bytes = intent
+            .payload
+            .body()
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["schema"], "canonical-record/v1");
+        assert_eq!(body["seq"], 1);
+        assert_eq!(body["text"], "record sentinel 雪");
+        assert_eq!(body["source_state_hash"], "11".repeat(32));
+        assert_eq!(input_kind(&intent), "canonical_record");
+        let receipt = publish(&s3, &config, &intent).await.unwrap();
+        assert_eq!(publish(&s3, &config, &intent).await.unwrap(), receipt);
+        let actual = s3
+            .get_object()
+            .bucket(&config.bucket)
+            .key(&receipt.0)
+            .version_id(&receipt.1)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            !actual
+                .metadata()
+                .unwrap()
+                .contains_key("x-index-lexical-profile-hash")
+        );
+        let actual = actual.body.collect().await.unwrap().into_bytes();
+        assert_eq!(actual, bytes);
+        acknowledge(&mut client, &intent, &receipt.0, &receipt.1, &receipt.2)
+            .await
+            .unwrap();
+        if let Ok(path) = std::env::var("LBFS_EXPORT_RECORD_PROOF_PATH") {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut output = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap();
+            output.write_all(&actual).unwrap();
+        }
     }
 
     #[tokio::test]
