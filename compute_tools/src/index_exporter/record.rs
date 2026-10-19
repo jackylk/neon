@@ -65,7 +65,7 @@ pub(super) async fn claim(
     let token = Uuid::new_v4().to_string();
     let row=tx.query_opt(&format!("WITH candidate AS (SELECT i.event_id FROM {s}.index_export_intents i JOIN {s}.session_records r ON r.entry_id=i.entry_id AND r.prefix_state_hash=i.source_state_hash AND r.record_hash=i.content_hash AND i.fingerprint=r.record_hash JOIN {s}.entries e ON e.entry_id=r.entry_id WHERE i.incarnation=$1 AND i.source_config_version=$2 AND i.job_kind='record_content' AND i.status IN ('pending','uploading') AND i.available_at<=clock_timestamp() AND (i.lease_expires_at IS NULL OR i.lease_expires_at<=clock_timestamp()) ORDER BY i.available_at,i.event_id FOR UPDATE OF i SKIP LOCKED LIMIT 1), c AS (UPDATE {s}.index_export_intents i SET status='uploading',attempts=attempts+1,lease_token=$3::text::uuid,lease_expires_at=clock_timestamp()+interval '2 minutes',updated_at=clock_timestamp() FROM candidate WHERE i.event_id=candidate.event_id RETURNING i.*) SELECT c.event_id::text,c.entry_id::text,encode(c.source_state_hash,'hex'),encode(c.fingerprint,'hex'),c.incarnation,c.source_config_version,c.job_kind,''::text,'{MEDIA}'::text,0::int,encode(c.content_hash,'hex') FROM c"),&[&inc,&version,&token]).await?;
     let payload = if let Some(row) = &row {
-        match spool_claim(&tx, schema, row, &token, true).await {
+        match spool_claim(&tx, schema, row, &token).await {
             Ok(p) => Some(p),
             Err(e) => {
                 tx.commit().await?;
@@ -85,13 +85,13 @@ pub(super) async fn claim(
         media_type: MEDIA.into(),
         payload: payload.unwrap(),
         lease_owner: token,
-        event: Some(EventIdentity {
+        event: EventIdentity {
             event_id: r.get(0),
             fingerprint: r.get(3),
             incarnation: r.get(4),
             source_config_version: r.get(5),
             job_kind: r.get(6),
             content_hash: r.get(10),
-        }),
+        },
     }))
 }

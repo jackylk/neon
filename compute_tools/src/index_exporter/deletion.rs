@@ -52,13 +52,13 @@ pub(super) async fn claim(
             checksum: hex::encode(Sha256::digest(&bytes)),
         },
         lease_owner: token,
-        event: Some(EventIdentity {
+        event: EventIdentity {
             event_id: event,
             fingerprint,
             incarnation: inc,
             source_config_version: version,
             job_kind: "tombstone".into(),
             content_hash: String::new(),
-        }),
+        },
     }))
 }

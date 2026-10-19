@@ -101,16 +101,22 @@ pub(super) async fn spool(
     if !(0..=MAX_SECTIONS).contains(&count) {
         bail!("canonical section count outside 0..100000");
     }
-    // Absence of occurrences alone is not proof of an empty document. Permit
-    // zero sections only for an exact current zero-byte source, including its
-    // content hash, inside the same repeatable-read snapshot as the lexical head.
+    // A successful lexical publication records its cardinality atomically.
+    // An absent row is not an empty head, even if every occurrence was lost.
+    let expected: Option<i64> = transaction.query_one(
+        &format!("SELECT active_section_count FROM {s}.file_index_state WHERE entry_id=$1::text::uuid AND active_state_hash=decode($2,'hex') AND active_state_hash=desired_state_hash AND active_fingerprint=desired_fingerprint"),
+        &[&entry,&state],
+    ).await?.try_get(0)?;
+    if expected != Some(count) {
+        bail!("canonical lexical section count does not match its durable head");
+    }
     if count == 0 {
-        let empty: bool = transaction.query_one(
-            &format!("SELECT EXISTS(SELECT 1 FROM {s}.entries e JOIN {s}.file_contents f USING(entry_id) WHERE e.entry_id=$1::text::uuid AND e.state_hash=decode($2,'hex') AND octet_length(f.data)=0 AND e.content_hash=sha256(f.data))"),
-            &[&entry, &state],
+        let valid: bool = transaction.query_one(
+            &format!("SELECT EXISTS(SELECT 1 FROM {s}.entries e JOIN {s}.file_contents f USING(entry_id) WHERE e.entry_id=$1::text::uuid AND e.state_hash=decode($2,'hex') AND octet_length(f.data)<=$3 AND e.content_hash=sha256(f.data))"),
+            &[&entry,&state,&(MAX_FILE_BYTES as i32)],
         ).await?.get(0);
-        if !empty {
-            bail!("zero-section canonical input requires a proven empty current file");
+        if !valid {
+            bail!("zero-section canonical input requires a verified current source");
         }
     }
     let mut out = Writer {

@@ -6,9 +6,10 @@ fn config() -> Config {
         database_name: "test".into(),
         tenant_id: "test".into(),
         namespace_id: "lakebasefs".into(),
+        workspace_id: "ws-test".into(),
         source_generation: 1,
         source_config_version: 1,
-        journal: true,
+
         endpoint: "test".into(),
         region: "test".into(),
         bucket: "test".into(),
@@ -23,8 +24,9 @@ async fn fixture(client: &tokio_postgres::Client) {
             section_content_hash bytea,line_start int,line_end int,PRIMARY KEY(entry_id,ordinal));
         CREATE TABLE section_contents(section_content_hash bytea,lexical_profile_hash bytea,
             heading text,body text,PRIMARY KEY(section_content_hash,lexical_profile_hash));
-        INSERT INTO file_index_state SELECT entry_id,state_hash,decode(repeat('55',32),'hex'),
+        INSERT INTO file_index_state(entry_id,desired_state_hash,desired_fingerprint,active_state_hash,active_fingerprint) SELECT entry_id,state_hash,decode(repeat('55',32),'hex'),
             state_hash,decode(repeat('55',32),'hex') FROM entries;
+        UPDATE file_index_state SET active_section_count=2;
         INSERT INTO file_semantic_state SELECT entry_id,'embed@1',state_hash,decode(repeat('77',32),'hex') FROM entries;
         INSERT INTO section_contents VALUES
             (decode('0ef7cc6214138de19a230af7c4f26b6a83e032f55b5b01bb652aed9fe381ef5d','hex'),decode(repeat('33',32),'hex'),
@@ -84,10 +86,7 @@ async fn zero_occurrences_without_an_empty_current_source_preserve_pending_oblig
         let error = claim_journal(&mut client, "folder_v2", &config())
             .await
             .unwrap_err();
-        assert!(
-            error.to_string().contains("proven empty current file"),
-            "{error:#}"
-        );
+        assert!(error.to_string().contains("section count"), "{error:#}");
         let row = client.query_one("SELECT status,object_version_id,lease_token::text,available_at>clock_timestamp() FROM index_export_intents",&[]).await.unwrap();
         assert_eq!(row.get::<_, String>(0), "pending");
         assert!(row.get::<_, Option<String>>(1).is_none());
@@ -97,12 +96,58 @@ async fn zero_occurrences_without_an_empty_current_source_preserve_pending_oblig
 }
 
 #[tokio::test]
+async fn native_markdown_content_exports_the_completed_zero_section_head() {
+    let (_pg, mut client) = postgres().await;
+    fixture(&client).await;
+    client.batch_execute("UPDATE file_index_state SET active_section_count=0; DELETE FROM section_occurrences; UPDATE file_contents SET data='  \n\t'::bytea; UPDATE entries SET content_hash=(SELECT sha256(data) FROM file_contents LIMIT 1); DELETE FROM index_export_intents; INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,media_type) SELECT '00000000-0000-0000-0000-000000000062',entry_id,state_hash,decode(repeat('55',32),'hex'),1,1,'file_content',content_hash,decode(repeat('33',32),'hex'),'text/markdown' FROM entries;").await.unwrap();
+    let intent = claim_journal(&mut client, "folder_v2", &config())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(input_kind(&intent), "canonical_sections");
+    let bytes = intent
+        .payload
+        .body()
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["sections"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn nonempty_zero_section_head_with_durable_count_exports_without_fake_sections() {
+    let (_pg, mut client) = postgres().await;
+    fixture(&client).await;
+    client.batch_execute("UPDATE file_index_state SET active_section_count=0; DELETE FROM section_occurrences; UPDATE file_contents SET data='  \n\t'::bytea; UPDATE entries SET content_hash=(SELECT sha256(data) FROM file_contents LIMIT 1); DELETE FROM index_export_intents; INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,embedding_profile_id,media_type) SELECT '00000000-0000-0000-0000-000000000052',entry_id,state_hash,decode(repeat('77',32),'hex'),1,1,'semantic_content',content_hash,decode(repeat('33',32),'hex'),'embed@1','text/markdown' FROM entries;").await.unwrap();
+    let intent = claim_journal(&mut client, "folder_v2", &config())
+        .await
+        .unwrap()
+        .expect("complete nonempty zero-section head must be exportable");
+    let bytes = intent
+        .payload
+        .body()
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(payload["sections"], serde_json::json!([]));
+    assert_eq!(payload["schema"], "canonical-sections/v1");
+}
+
+#[tokio::test]
 async fn empty_file_canonical_exports_exact_version_and_acks_without_a_fake_section() {
     let (_pg, mut client) = postgres().await;
     fixture(&client).await;
-    client.batch_execute("DELETE FROM section_occurrences; UPDATE file_contents SET data=''::bytea; UPDATE entries SET content_hash=sha256(''::bytea); DELETE FROM index_export_intents; INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,embedding_profile_id,media_type) SELECT '00000000-0000-0000-0000-000000000042',entry_id,state_hash,decode(repeat('77',32),'hex'),1,1,'semantic_content',content_hash,decode(repeat('33',32),'hex'),'embed@1','text/markdown' FROM entries;").await.unwrap();
-    let (_obs, s3, mut config) = super::tests::minio().await;
-    config.journal = true;
+    client.batch_execute("UPDATE file_index_state SET active_section_count=0; DELETE FROM section_occurrences; UPDATE file_contents SET data=''::bytea; UPDATE entries SET content_hash=sha256(''::bytea); DELETE FROM index_export_intents; INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,embedding_profile_id,media_type) SELECT '00000000-0000-0000-0000-000000000042',entry_id,state_hash,decode(repeat('77',32),'hex'),1,1,'semantic_content',content_hash,decode(repeat('33',32),'hex'),'embed@1','text/markdown' FROM entries;").await.unwrap();
+    let (_obs, s3, config) = super::tests::minio().await;
+
     let intent = claim_journal(&mut client, "folder_v2", &config)
         .await
         .unwrap()
@@ -210,7 +255,7 @@ async fn semantic_only_exports_current_sections_with_exact_lexical_profile() {
         intent.media_type,
         "application/vnd.lakeon.canonical-sections+json;version=1"
     );
-    let event = intent.event.as_ref().unwrap();
+    let event = &intent.event;
     assert_eq!(event.job_kind, "semantic_content");
     assert_eq!(event.fingerprint, "77".repeat(32));
     assert_eq!(hex::encode(Sha256::digest(&bytes)), intent.payload.checksum);
@@ -242,7 +287,7 @@ async fn changed_semantic_target_retires_only_the_old_intent_before_claiming_the
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(intent.event.as_ref().unwrap().fingerprint, "88".repeat(32));
+    assert_eq!(intent.event.fingerprint, "88".repeat(32));
     let row=client.query_one("SELECT status,object_version_id FROM index_export_intents WHERE event_id='00000000-0000-0000-0000-000000000012'",&[]).await.unwrap();
     assert_eq!(
         row.get::<_, String>(0),
@@ -266,12 +311,10 @@ async fn lexical_work_in_progress_leaves_semantic_obligation_pending_without_a_l
         )
         .await
         .unwrap();
-    assert!(
-        claim_journal(&mut client, "folder_v2", &config())
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(claim_journal(&mut client, "folder_v2", &config())
+        .await
+        .unwrap()
+        .is_none());
     let row = client
         .query_one(
             "SELECT status,attempts,lease_token::text FROM index_export_intents",
@@ -294,8 +337,8 @@ async fn canonical_pg_to_versioned_object_readback_and_full_identity_ack() {
         .execute("DELETE FROM file_contents", &[])
         .await
         .unwrap();
-    let (_obs, s3, mut config) = super::tests::minio().await;
-    config.journal = true;
+    let (_obs, s3, config) = super::tests::minio().await;
+
     let intent = claim_journal(&mut client, "folder_v2", &config)
         .await
         .unwrap()
@@ -393,7 +436,7 @@ async fn chunked_unicode_sections_roundtrip_and_encoded_size_is_bounded() {
     fixture(&client).await;
     // Put escape sequences and multi-byte characters on both sides of the
     // character-chunk boundary; hash the unescaped source, not its JSON encoding.
-    client.batch_execute("DELETE FROM section_occurrences WHERE ordinal=1;
+    client.batch_execute("UPDATE file_index_state SET active_section_count=1; DELETE FROM section_occurrences WHERE ordinal=1;
         DELETE FROM section_contents;
         INSERT INTO section_contents SELECT sha256(convert_to('H'||chr(0+1)||'placeholder','UTF8')),decode(repeat('33',32),'hex'),'H',repeat('雪',262143)||chr(34)||chr(92)||chr(10)||repeat('a',262145);").await.unwrap();
     // PostgreSQL text forbids NUL, so build the content hash in BYTEA.
@@ -454,9 +497,9 @@ async fn chunked_unicode_sections_roundtrip_and_encoded_size_is_bounded() {
 async fn canonical_pagination_preserves_repeated_occurrences_in_order() {
     let (_owned, mut client) = postgres().await;
     fixture(&client).await;
-    client.batch_execute("DELETE FROM section_occurrences WHERE ordinal=1;
+    client.batch_execute("UPDATE file_index_state SET active_section_count=1; DELETE FROM section_occurrences WHERE ordinal=1;
         INSERT INTO section_occurrences SELECT o.entry_id,n,o.source_state_hash,o.section_content_hash,o.line_start,o.line_end
-        FROM section_occurrences o CROSS JOIN generate_series(1,129) n;").await.unwrap();
+        FROM section_occurrences o CROSS JOIN generate_series(1,129) n; UPDATE file_index_state SET active_section_count=130;").await.unwrap();
     let intent = claim_journal(&mut client, "folder_v2", &config())
         .await
         .unwrap()
@@ -532,12 +575,10 @@ async fn supersession_does_not_retire_other_incarnations_or_source_configuration
         SELECT v.id::uuid,i.entry_id,i.source_state_hash,i.fingerprint,v.inc,v.config,i.job_kind,i.content_hash,i.lexical_profile_hash,i.embedding_profile_id,i.media_type
         FROM index_export_intents i CROSS JOIN (VALUES
             ('00000000-0000-0000-0000-000000000013',2,1),('00000000-0000-0000-0000-000000000014',1,2)) v(id,inc,config);").await.unwrap();
-    assert!(
-        claim_journal(&mut client, "folder_v2", &config())
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(claim_journal(&mut client, "folder_v2", &config())
+        .await
+        .unwrap()
+        .is_none());
     let rows = client
         .query(
             "SELECT status FROM index_export_intents ORDER BY event_id",

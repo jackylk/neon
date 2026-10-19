@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::{Builder as S3ConfigBuilder, Region};
 use aws_smithy_types::byte_stream::ByteStream;
@@ -23,9 +23,10 @@ struct Config {
     database_name: String,
     tenant_id: String,
     namespace_id: String,
+    workspace_id: String,
     source_generation: u64,
     source_config_version: u64,
-    journal: bool,
+
     endpoint: String,
     region: String,
     bucket: String,
@@ -41,7 +42,7 @@ struct Intent {
     media_type: String,
     payload: Spool,
     lease_owner: String,
-    event: Option<EventIdentity>,
+    event: EventIdentity,
 }
 
 // Match LakebaseFS file_contents_max_file_bytes; do not let a corrupt or old
@@ -161,7 +162,7 @@ async fn run(compute: &ComputeNode) -> Result<()> {
             warn!(%error, "LakebaseFS exporter database connection ended");
         }
     });
-    let mut schemas = discover_schemas(&client, config.journal).await?.into_iter();
+    let mut schemas = discover_schemas(&client).await?.into_iter();
     while let Some(intent) = next_claim(&mut client, &mut schemas, &config).await {
         let published =
             tokio::time::timeout(Duration::from_secs(60), publish(&s3, &config, &intent))
@@ -187,11 +188,7 @@ async fn next_claim(
     config: &Config,
 ) -> Option<Intent> {
     for schema in schemas {
-        let result = if config.journal {
-            claim_journal(client, &schema, config).await
-        } else {
-            claim(client, &schema).await
-        };
+        let result = claim_journal(client, &schema, config).await;
         match result {
             Ok(Some(intent)) => return Some(intent),
             Ok(None) => {}
@@ -210,14 +207,13 @@ async fn spool_claim(
     schema: &str,
     row: &tokio_postgres::Row,
     token: &str,
-    journal: bool,
 ) -> Result<Spool> {
     transaction
         .batch_execute("SAVEPOINT export_payload")
         .await?;
-    let (entry, len) = if journal { (1, 9) } else { (0, 5) };
+    let (entry, len) = (1, 9);
     let result = tokio::time::timeout(Duration::from_secs(30), async {
-        if journal && row.get::<_, String>(6) == "record_content" {
+        if row.get::<_, String>(6) == "record_content" {
             record::spool(
                 transaction,
                 schema,
@@ -226,7 +222,9 @@ async fn spool_claim(
                 &row.get::<_, String>(10),
             )
             .await
-        } else if journal && row.get::<_, String>(6) == "semantic_content" {
+        } else if row.get::<_, String>(8)
+            == "application/vnd.lakeon.canonical-sections+json;version=1"
+        {
             canonical::spool(
                 transaction,
                 schema,
@@ -252,7 +250,7 @@ async fn spool_claim(
         transaction
             .batch_execute("ROLLBACK TO SAVEPOINT export_payload")
             .await?;
-        defer_materialization(transaction, schema, row, token, journal, &error.to_string()).await?;
+        defer_materialization(transaction, schema, row, token, &error.to_string()).await?;
     }
     result
 }
@@ -262,22 +260,44 @@ async fn defer_materialization(
     schema: &str,
     row: &tokio_postgres::Row,
     token: &str,
-    journal: bool,
+
     error: &str,
 ) -> Result<()> {
     let error: String = error.chars().take(1000).collect();
     let s = quote(schema);
-    let changed = if journal {
-        transaction.execute(&format!("UPDATE {s}.index_export_intents SET status='pending',available_at=clock_timestamp()+interval '10 seconds',lease_token=NULL,lease_expires_at=NULL,last_error=$1,updated_at=clock_timestamp() WHERE event_id=$2::text::uuid AND entry_id=$3::text::uuid AND source_state_hash=decode($4,'hex') AND fingerprint=decode($5,'hex') AND incarnation=$6 AND source_config_version=$7 AND job_kind=$8 AND status='uploading' AND lease_token=$9::text::uuid AND lease_expires_at>clock_timestamp()"),
-            &[&error,&row.get::<_,String>(0),&row.get::<_,String>(1),&row.get::<_,String>(2),&row.get::<_,String>(3),&row.get::<_,i64>(4),&row.get::<_,i64>(5),&row.get::<_,String>(6),&token]).await?
-    } else {
-        transaction.execute(&format!("UPDATE {s}.index_export_outbox SET status='pending',available_at=clock_timestamp()+interval '10 seconds',lease_owner=NULL,lease_expires_at=NULL,last_error=$1,updated_at=clock_timestamp() WHERE entry_id=$2::text::uuid AND source_state_hash=decode($3,'hex') AND lexical_profile_hash=decode($4,'hex') AND submission_id=$5 AND lease_owner=$6 AND lease_expires_at>clock_timestamp() AND status='uploading'"),
-            &[&error,&row.get::<_,String>(0),&row.get::<_,String>(1),&row.get::<_,String>(2),&row.get::<_,String>(3),&token]).await?
-    };
+    let changed = transaction.execute(&format!("UPDATE {s}.index_export_intents SET status='pending',available_at=clock_timestamp()+interval '10 seconds',lease_token=NULL,lease_expires_at=NULL,last_error=$1,updated_at=clock_timestamp() WHERE event_id=$2::text::uuid AND entry_id=$3::text::uuid AND source_state_hash=decode($4,'hex') AND fingerprint=decode($5,'hex') AND incarnation=$6 AND source_config_version=$7 AND job_kind=$8 AND status='uploading' AND lease_token=$9::text::uuid AND lease_expires_at>clock_timestamp()"),
+            &[&error,&row.get::<_,String>(0),&row.get::<_,String>(1),&row.get::<_,String>(2),&row.get::<_,String>(3),&row.get::<_,i64>(4),&row.get::<_,i64>(5),&row.get::<_,String>(6),&token]).await?;
     if changed != 1 {
         bail!("materialization backoff lost its claim");
     }
     Ok(())
+}
+
+fn validate_assignment(export: &compute_api::spec::LakeonIndexExportSpec) -> Result<(u64, u64)> {
+    if export.workspace_id.is_empty()
+        || export.workspace_id.len() > 64
+        || !export
+            .workspace_id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+        || export.protocol.as_deref() != Some("event-v2")
+        || export.workspace_incarnation != Some(export.source_generation)
+        || export.source_generation == 0
+        || export.source_generation > i64::MAX as u64
+        || export
+            .source_config_version
+            .is_none_or(|v| v == 0 || v > i64::MAX as u64)
+    {
+        bail!(
+            "only event-v2 with explicit current incarnation and Source configuration is supported"
+        );
+    }
+    Ok((
+        export.source_generation,
+        export
+            .source_config_version
+            .expect("validated Source version"),
+    ))
 }
 
 impl Config {
@@ -303,28 +323,15 @@ impl Config {
             .context("compute assignment has no database")?
             .name
             .clone();
-        let journal = match export.protocol.as_deref() {
-            None | Some("legacy-v1") => false,
-            Some("event-v2") => true,
-            Some(_) => bail!("unknown LakebaseFS export protocol"),
-        };
-        if journal
-            && (export.workspace_incarnation != Some(export.source_generation)
-                || export.source_generation == 0
-                || export.source_generation > i64::MAX as u64
-                || export
-                    .source_config_version
-                    .is_none_or(|version| version == 0 || version > i64::MAX as u64))
-        {
-            bail!("event-v2 requires explicit matching incarnation and source configuration");
-        }
+        let (source_generation, source_config_version) = validate_assignment(export)?;
         Ok(Self {
             database_name,
             tenant_id: export.tenant_id.clone(),
             namespace_id: export.namespace_id.clone(),
-            source_generation: export.source_generation,
-            source_config_version: export.source_config_version.unwrap_or(1),
-            journal,
+            workspace_id: export.workspace_id.clone(),
+            source_generation,
+            source_config_version,
+
             endpoint: required("LBFS_INDEX_OBS_ENDPOINT")?,
             region: required("AWS_REGION")?,
             bucket: required("LBFS_INDEX_OBS_BUCKET")?,
@@ -332,12 +339,8 @@ impl Config {
     }
 }
 
-async fn discover_schemas(client: &tokio_postgres::Client, journal: bool) -> Result<Vec<String>> {
-    let table = if journal {
-        "index_export_intents"
-    } else {
-        "index_export_outbox"
-    };
+async fn discover_schemas(client: &tokio_postgres::Client) -> Result<Vec<String>> {
+    let table = "index_export_intents";
     let rows = client.query("SELECT n.nspname FROM pg_namespace n JOIN pg_class c ON c.relnamespace=n.oid WHERE c.relname=$1 AND c.relkind='r' AND n.nspname !~ '^pg_' ORDER BY n.nspname", &[&table]).await?;
     Ok(rows
         .into_iter()
@@ -358,46 +361,7 @@ async fn materialization_transaction(
     Ok(transaction)
 }
 
-async fn claim(client: &mut tokio_postgres::Client, schema: &str) -> Result<Option<Intent>> {
-    let transaction = materialization_transaction(client).await?;
-    let supersede_sql = format!(
-        "UPDATE {s}.index_export_outbox o SET status='dead',lease_owner=NULL,lease_expires_at=NULL,last_error='superseded by a newer file revision',updated_at=now() WHERE o.status IN ('pending','uploading') AND NOT EXISTS (SELECT 1 FROM {s}.entries e JOIN {s}.file_contents f ON f.entry_id=e.entry_id WHERE e.entry_id=o.entry_id AND e.state_hash=o.source_state_hash)",
-        s = quote(schema)
-    );
-    transaction.execute(&supersede_sql, &[]).await?;
-    let sql = format!(
-        "WITH candidate AS (SELECT entry_id,source_state_hash,submission_id,media_type FROM {s}.index_export_outbox WHERE lexical_profile_hash IS NOT NULL AND status IN ('pending','uploading') AND available_at<=now() AND (lease_expires_at IS NULL OR lease_expires_at<=now()) ORDER BY available_at,entry_id FOR UPDATE SKIP LOCKED LIMIT 1), claimed AS (UPDATE {s}.index_export_outbox o SET status='uploading',attempts=attempts+1,lease_owner=$1,lease_expires_at=now()+interval '2 minutes',updated_at=now() FROM candidate c WHERE o.entry_id=c.entry_id AND o.source_state_hash=c.source_state_hash RETURNING o.entry_id,encode(o.source_state_hash,'hex') AS state_hash,encode(o.lexical_profile_hash,'hex') AS lexical_profile_hash,o.submission_id,o.media_type) SELECT c.entry_id::text,c.state_hash,c.lexical_profile_hash,c.submission_id,c.media_type,octet_length(f.data) FROM claimed c JOIN {s}.file_contents f ON f.entry_id=c.entry_id JOIN {s}.entries e ON e.entry_id=c.entry_id AND encode(e.state_hash,'hex')=c.state_hash",
-        s = quote(schema)
-    );
-    // A hostname is shared by consecutive attempts. Each claim needs its own token.
-    let owner = Uuid::new_v4().to_string();
-    let row = transaction.query_opt(&sql, &[&owner]).await?;
-    let payload = match &row {
-        Some(row) => match spool_claim(&transaction, schema, row, &owner, false).await {
-            Ok(payload) => Some(payload),
-            Err(error) => {
-                transaction.commit().await?;
-                return Err(error);
-            }
-        },
-        None => None,
-    };
-    transaction.commit().await?;
-    Ok(row.map(|row| Intent {
-        schema: schema.into(),
-        entry_id: row.get(0),
-        state_hash: row.get(1),
-        lexical_profile_hash: row.get(2),
-        submission_id: row.get(3),
-        media_type: row.get(4),
-        payload: payload.expect("claimed row has a spool"),
-        lease_owner: owner,
-        event: None,
-    }))
-}
-
-/// An explicit event-v2 source assignment is required; legacy timeline-derived
-/// source generations are never silently relabelled to workspace incarnation 1.
+/// Every claim binds the current workspace incarnation and Source configuration.
 async fn journal_scope(
     transaction: &tokio_postgres::Transaction<'_>,
     schema: &str,
@@ -475,7 +439,7 @@ async fn claim_journal(
         LEFT JOIN {s}.file_contents f ON f.entry_id=e.entry_id \
         LEFT JOIN {s}.file_index_state l ON l.entry_id=e.entry_id \
         WHERE i.incarnation=$1 AND i.source_config_version=$2 AND i.lexical_profile_hash IS NOT NULL \
-        AND ((i.job_kind IN ('file_content','repair') AND f.entry_id IS NOT NULL) \
+        AND ((i.job_kind IN ('file_content','repair') AND f.entry_id IS NOT NULL AND (i.media_type <> 'text/markdown' OR (l.active_state_hash=i.source_state_hash AND l.desired_state_hash=i.source_state_hash AND l.active_fingerprint=i.fingerprint AND l.desired_fingerprint=i.fingerprint AND l.active_section_count IS NOT NULL))) \
           OR (i.job_kind='semantic_content' AND l.active_state_hash=i.source_state_hash \
               AND l.active_fingerprint=l.desired_fingerprint AND l.desired_state_hash=i.source_state_hash \
               AND EXISTS(SELECT 1 FROM {s}.file_semantic_state m WHERE m.entry_id=i.entry_id \
@@ -489,7 +453,7 @@ async fn claim_journal(
         FROM candidate c WHERE i.event_id=c.event_id RETURNING i.*) \
         SELECT c.event_id::text,c.entry_id::text,encode(c.source_state_hash,'hex'),encode(c.fingerprint,'hex'), \
         c.incarnation,c.source_config_version,c.job_kind,encode(c.lexical_profile_hash,'hex'), \
-        CASE WHEN c.job_kind='semantic_content' THEN 'application/vnd.lakeon.canonical-sections+json;version=1' ELSE c.media_type END, \
+        CASE WHEN c.job_kind='semantic_content' OR (c.job_kind IN ('file_content','repair') AND c.media_type='text/markdown') THEN 'application/vnd.lakeon.canonical-sections+json;version=1' ELSE c.media_type END, \
         coalesce(octet_length(f.data),0),encode(c.content_hash,'hex'),encode(l.active_fingerprint,'hex') \
         FROM claimed c LEFT JOIN {s}.file_contents f ON f.entry_id=c.entry_id \
         LEFT JOIN {s}.file_index_state l ON l.entry_id=c.entry_id"
@@ -498,7 +462,7 @@ async fn claim_journal(
         .query_opt(&sql, &[&incarnation, &version, &token])
         .await?;
     let payload = match &row {
-        Some(row) => match spool_claim(&transaction, schema, row, &token, true).await {
+        Some(row) => match spool_claim(&transaction, schema, row, &token).await {
             Ok(payload) => Some(payload),
             Err(error) => {
                 transaction.commit().await?;
@@ -519,37 +483,36 @@ async fn claim_journal(
             media_type: row.get(8),
             payload: payload.expect("claimed event has a spool"),
             lease_owner: token,
-            event: Some(EventIdentity {
+            event: EventIdentity {
                 event_id,
                 fingerprint: row.get(3),
                 incarnation: row.get(4),
                 source_config_version: row.get(5),
                 job_kind: row.get(6),
                 content_hash: row.get(10),
-            }),
+            },
         }
     }))
 }
 
 fn source_id(config: &Config, intent: &Intent) -> Uuid {
-    if let Some(event) = &intent.event {
-        deterministic_source_id(
-            &config.tenant_id,
-            &format!("{}:incarnation:{}", intent.schema, event.incarnation),
-        )
-    } else {
-        deterministic_source_id(&config.tenant_id, &intent.schema)
-    }
+    deterministic_source_id(
+        &config.tenant_id,
+        &format!(
+            "{}:{}:incarnation:{}",
+            config.workspace_id, intent.schema, intent.event.incarnation
+        ),
+    )
 }
 
-async fn acknowledge_journal(
+async fn acknowledge(
     client: &mut tokio_postgres::Client,
     intent: &Intent,
     key: &str,
     version: &str,
     checksum: &str,
 ) -> Result<()> {
-    let event = intent.event.as_ref().context("event identity required")?;
+    let event = &intent.event;
     let transaction = client.transaction().await?;
     if journal_scope(&transaction, &intent.schema).await?
         != Some((event.incarnation, event.source_config_version))
@@ -587,12 +550,8 @@ async fn acknowledge_journal(
     Ok(())
 }
 
-async fn retry_journal(
-    client: &mut tokio_postgres::Client,
-    intent: &Intent,
-    error: &str,
-) -> Result<()> {
-    let event = intent.event.as_ref().context("event identity required")?;
+async fn retry(client: &mut tokio_postgres::Client, intent: &Intent, error: &str) -> Result<()> {
+    let event = &intent.event;
     let transaction = client.transaction().await?;
     if journal_scope(&transaction, &intent.schema).await?
         != Some((event.incarnation, event.source_config_version))
@@ -624,10 +583,13 @@ async fn retry_journal(
 }
 
 fn input_kind(intent: &Intent) -> &'static str {
-    match intent.event.as_ref().map(|e| e.job_kind.as_str()) {
-        Some("semantic_content") => "canonical_sections",
-        Some("record_content") => "canonical_record",
-        Some("tombstone") => "delete",
+    if intent.media_type == "application/vnd.lakeon.canonical-sections+json;version=1" {
+        return "canonical_sections";
+    }
+    match intent.event.job_kind.as_str() {
+        "semantic_content" => "canonical_sections",
+        "record_content" => "canonical_record",
+        "tombstone" => "delete",
         _ => "raw_file",
     }
 }
@@ -638,12 +600,9 @@ async fn publish(
     intent: &Intent,
 ) -> Result<(String, String, String)> {
     let checksum = intent.payload.checksum.clone();
-    if let Some(event) = &intent.event {
-        if matches!(event.job_kind.as_str(), "file_content" | "repair")
-            && event.content_hash != checksum
-        {
-            bail!("source content checksum does not match committed export intent");
-        }
+    let event = &intent.event;
+    if input_kind(intent) == "raw_file" && event.content_hash != checksum {
+        bail!("source content checksum does not match committed export intent");
     }
     let source_id = source_id(config, intent);
     let key = object_key(config, intent, source_id);
@@ -836,66 +795,6 @@ fn deterministic_source_id(tenant: &str, collection: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-async fn acknowledge(
-    client: &mut tokio_postgres::Client,
-    intent: &Intent,
-    key: &str,
-    version: &str,
-    checksum: &str,
-) -> Result<()> {
-    if intent.event.is_some() {
-        return acknowledge_journal(client, intent, key, version, checksum).await;
-    }
-    let sql = format!(
-        "UPDATE {s}.index_export_outbox SET status='exported',object_key=$1,object_version_id=$2,object_checksum=$3,lease_owner=NULL,lease_expires_at=NULL,last_error=NULL,updated_at=now() WHERE entry_id=$4::text::uuid AND source_state_hash=decode($5,'hex') AND lexical_profile_hash=decode($6,'hex') AND submission_id=$7 AND lease_owner=$8 AND lease_expires_at>clock_timestamp() AND status='uploading'",
-        s = quote(&intent.schema)
-    );
-    if client
-        .execute(
-            &sql,
-            &[
-                &key,
-                &version,
-                &checksum,
-                &intent.entry_id,
-                &intent.state_hash,
-                &intent.lexical_profile_hash,
-                &intent.submission_id,
-                &intent.lease_owner,
-            ],
-        )
-        .await?
-        != 1
-    {
-        bail!("export acknowledgement lost its claim");
-    }
-    Ok(())
-}
-
-async fn retry(client: &mut tokio_postgres::Client, intent: &Intent, error: &str) -> Result<()> {
-    if intent.event.is_some() {
-        return retry_journal(client, intent, error).await;
-    }
-    let sql = format!(
-        "UPDATE {s}.index_export_outbox SET status='pending',available_at=now()+interval '10 seconds',lease_owner=NULL,lease_expires_at=NULL,last_error=$1,updated_at=now() WHERE entry_id=$2::text::uuid AND source_state_hash=decode($3,'hex') AND lexical_profile_hash=decode($4,'hex') AND submission_id=$5 AND lease_owner=$6 AND lease_expires_at>clock_timestamp() AND status='uploading'",
-        s = quote(&intent.schema)
-    );
-    client
-        .execute(
-            &sql,
-            &[
-                &error.chars().take(1000).collect::<String>(),
-                &intent.entry_id,
-                &intent.state_hash,
-                &intent.lexical_profile_hash,
-                &intent.submission_id,
-                &intent.lease_owner,
-            ],
-        )
-        .await?;
-    Ok(())
-}
-
 fn quote(value: &str) -> String {
     assert!(valid_ident(value));
     format!("\"{value}\"")
@@ -987,29 +886,56 @@ mod tests {
         }
     }
 
-    async fn legacy_fixture(client: &tokio_postgres::Client) {
-        legacy_fixture_schema(client, "folder_a").await;
+    async fn file_fixture(client: &tokio_postgres::Client) {
+        file_fixture_schema(client, "folder_a").await;
+    }
+    async fn file_fixture_schema(client: &tokio_postgres::Client, schema: &str) {
+        journal_fixture(client).await;
+        client.batch_execute(&format!("ALTER SCHEMA folder_v2 RENAME TO {}; SET search_path={},public; DELETE FROM index_export_intents; UPDATE entries SET content_hash=(SELECT sha256(data) FROM file_contents LIMIT 1); INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,media_type) SELECT '00000000-0000-0000-0000-000000000011',entry_id,state_hash,decode(repeat('22',32),'hex'),1,1,'file_content',content_hash,decode(repeat('33',32),'hex'),'application/pdf' FROM entries;",quote(schema),quote(schema))).await.unwrap();
+    }
+    async fn claim(client: &mut tokio_postgres::Client, schema: &str) -> Result<Option<Intent>> {
+        let config = Config {
+            database_name: "test".into(),
+            tenant_id: "test".into(),
+            namespace_id: "lakebasefs".into(),
+            workspace_id: "ws-test".into(),
+            source_generation: 1,
+            source_config_version: 1,
+            endpoint: "unused".into(),
+            region: "unused".into(),
+            bucket: "unused".into(),
+        };
+        claim_journal(client, schema, &config).await
     }
 
-    async fn legacy_fixture_schema(client: &tokio_postgres::Client, schema: &str) {
-        client.batch_execute(&"CREATE SCHEMA folder_a;
-            CREATE TABLE folder_a.entries(entry_id uuid PRIMARY KEY,state_hash bytea);
-            CREATE TABLE folder_a.file_contents(entry_id uuid PRIMARY KEY,data bytea);
-            CREATE TABLE folder_a.index_export_outbox(entry_id uuid,source_state_hash bytea,lexical_profile_hash bytea,
-                submission_id text,media_type text,status text,available_at timestamptz DEFAULT now(),lease_owner text,
-                lease_expires_at timestamptz,attempts int DEFAULT 0,last_error text,updated_at timestamptz DEFAULT now(),
-                object_key text,object_version_id text,object_checksum text);
-            INSERT INTO folder_a.entries VALUES('00000000-0000-0000-0000-000000000001',decode(repeat('11',32),'hex'));
-            INSERT INTO folder_a.file_contents VALUES('00000000-0000-0000-0000-000000000001',decode('6162','hex'));
-            INSERT INTO folder_a.index_export_outbox(entry_id,source_state_hash,lexical_profile_hash,submission_id,media_type,status)
-            VALUES('00000000-0000-0000-0000-000000000001',decode(repeat('11',32),'hex'),decode(repeat('22',32),'hex'),'event-a','text/markdown','pending');".replace("folder_a",schema)).await.unwrap();
+    #[test]
+    fn only_explicit_event_v2_assignments_are_accepted() {
+        let base = serde_json::json!({"tenant_id":"tenant-a","namespace_id":"lakebasefs","workspace_id":"ws-a","source_generation":7,
+            "protocol":"event-v2","workspace_incarnation":7,"source_config_version":1});
+        let parse = |value| {
+            serde_json::from_value::<compute_api::spec::LakeonIndexExportSpec>(value).unwrap()
+        };
+        assert_eq!(validate_assignment(&parse(base.clone())).unwrap(), (7, 1));
+        for field in ["protocol", "workspace_incarnation", "source_config_version"] {
+            let mut absent = base.clone();
+            absent.as_object_mut().unwrap().remove(field);
+            assert!(validate_assignment(&parse(absent)).is_err());
+        }
+        for old in ["legacy-v1", "unknown"] {
+            let mut value = base.clone();
+            value["protocol"] = serde_json::json!(old);
+            assert!(validate_assignment(&parse(value)).is_err());
+        }
+        let mut stale = base;
+        stale["workspace_incarnation"] = serde_json::json!(8);
+        assert!(validate_assignment(&parse(stale)).is_err());
     }
 
     #[tokio::test]
     async fn source_snapshot_survives_concurrent_same_size_replacement() {
         use std::os::unix::fs::MetadataExt;
         let (owned, mut client) = postgres().await;
-        legacy_fixture(&client).await;
+        file_fixture(&client).await;
         client
             .execute(
                 "UPDATE folder_a.file_contents SET data=convert_to(repeat('ab',1048583),'UTF8')",
@@ -1086,7 +1012,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_materialization_leaves_the_durable_intent_pending() {
         let (owned, mut client) = postgres().await;
-        legacy_fixture(&client).await;
+        file_fixture(&client).await;
         let output = std::process::Command::new("docker")
             .args(["port", &owned.0, "5432/tcp"])
             .output()
@@ -1116,7 +1042,7 @@ mod tests {
         locked.rollback().await.unwrap();
         let row = client
             .query_one(
-                "SELECT status,attempts FROM folder_a.index_export_outbox",
+                "SELECT status,attempts FROM folder_a.index_export_intents",
                 &[],
             )
             .await
@@ -1132,8 +1058,8 @@ mod tests {
     #[tokio::test]
     async fn failed_folder_does_not_prevent_another_folder_from_exporting() {
         let (_owned, mut client) = postgres().await;
-        legacy_fixture(&client).await;
-        legacy_fixture_schema(&client, "folder_b").await;
+        file_fixture(&client).await;
+        file_fixture_schema(&client, "folder_b").await;
         client
             .execute(
                 "UPDATE folder_a.file_contents SET data=convert_to(repeat('x',67108865),'UTF8')",
@@ -1145,9 +1071,10 @@ mod tests {
             database_name: "test".into(),
             tenant_id: "test".into(),
             namespace_id: "lakebasefs".into(),
+            workspace_id: "ws-test".into(),
             source_generation: 1,
             source_config_version: 1,
-            journal: false,
+
             endpoint: "test".into(),
             region: "test".into(),
             bucket: "test".into(),
@@ -1160,13 +1087,11 @@ mod tests {
         acknowledge(&mut client, &healthy, "healthy-key", "v1", &"33".repeat(32))
             .await
             .unwrap();
-        assert!(
-            next_claim(&mut client, &mut schemas, &config)
-                .await
-                .is_none()
-        );
+        assert!(next_claim(&mut client, &mut schemas, &config)
+            .await
+            .is_none());
         let status: String = client
-            .query_one("SELECT status FROM folder_b.index_export_outbox", &[])
+            .query_one("SELECT status FROM folder_b.index_export_intents", &[])
             .await
             .unwrap()
             .get(0);
@@ -1176,28 +1101,25 @@ mod tests {
     #[tokio::test]
     async fn stale_materialization_backoff_cannot_reset_a_new_lease() {
         let (_owned, mut client) = postgres().await;
-        legacy_fixture(&client).await;
+        file_fixture(&client).await;
         let first = claim(&mut client, "folder_a").await.unwrap().unwrap();
-        let row=client.query_one("SELECT entry_id::text,encode(source_state_hash,'hex'),encode(lexical_profile_hash,'hex'),submission_id FROM folder_a.index_export_outbox",&[]).await.unwrap();
-        client.execute("UPDATE folder_a.index_export_outbox SET lease_expires_at=clock_timestamp()-interval '1 second'",&[]).await.unwrap();
+        let row=client.query_one("SELECT event_id::text,entry_id::text,encode(source_state_hash,'hex'),encode(fingerprint,'hex'),incarnation,source_config_version,job_kind FROM folder_a.index_export_intents",&[]).await.unwrap();
+        client.execute("UPDATE folder_a.index_export_intents SET lease_expires_at=clock_timestamp()-interval '1 second'",&[]).await.unwrap();
         let next = claim(&mut client, "folder_a").await.unwrap().unwrap();
         let transaction = client.transaction().await.unwrap();
-        assert!(
-            defer_materialization(
-                &transaction,
-                "folder_a",
-                &row,
-                &first.lease_owner,
-                false,
-                "old failure"
-            )
-            .await
-            .is_err()
-        );
+        assert!(defer_materialization(
+            &transaction,
+            "folder_a",
+            &row,
+            &first.lease_owner,
+            "old failure"
+        )
+        .await
+        .is_err());
         transaction.commit().await.unwrap();
         let row = client
             .query_one(
-                "SELECT status,lease_owner,attempts FROM folder_a.index_export_outbox",
+                "SELECT status,lease_token::text,attempts FROM folder_a.index_export_intents",
                 &[],
             )
             .await
@@ -1213,12 +1135,12 @@ mod tests {
     #[tokio::test]
     async fn failed_materialization_does_not_starve_the_next_file() {
         let (_owned, mut client) = postgres().await;
-        legacy_fixture(&client).await;
+        file_fixture(&client).await;
         client.batch_execute("UPDATE folder_a.file_contents SET data=convert_to(repeat('x',67108865),'UTF8');
-            INSERT INTO folder_a.entries VALUES('00000000-0000-0000-0000-000000000002',decode(repeat('22',32),'hex'));
+            INSERT INTO folder_a.entries VALUES('00000000-0000-0000-0000-000000000002',decode(repeat('22',32),'hex'),sha256(decode('6162','hex')));
             INSERT INTO folder_a.file_contents VALUES('00000000-0000-0000-0000-000000000002',decode('6162','hex'));
-            INSERT INTO folder_a.index_export_outbox(entry_id,source_state_hash,lexical_profile_hash,submission_id,media_type,status)
-            VALUES('00000000-0000-0000-0000-000000000002',decode(repeat('22',32),'hex'),decode(repeat('33',32),'hex'),'event-b','text/markdown','pending');").await.unwrap();
+            INSERT INTO folder_a.index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,media_type,status)
+            VALUES('00000000-0000-0000-0000-000000000012','00000000-0000-0000-0000-000000000002',decode(repeat('22',32),'hex'),decode(repeat('22',32),'hex'),1,1,'file_content',sha256(decode('6162','hex')),decode(repeat('33',32),'hex'),'application/pdf','pending');").await.unwrap();
         assert!(claim(&mut client, "folder_a").await.is_err());
         let next = claim(&mut client, "folder_a")
             .await
@@ -1228,7 +1150,7 @@ mod tests {
         acknowledge(&mut client, &next, "next-key", "v1", &"33".repeat(32))
             .await
             .unwrap();
-        let row = client.query_one("SELECT status,attempts,available_at>clock_timestamp(),lease_owner FROM folder_a.index_export_outbox WHERE submission_id='event-a'",&[]).await.unwrap();
+        let row = client.query_one("SELECT status,attempts,available_at>clock_timestamp(),lease_token::text FROM folder_a.index_export_intents WHERE event_id='00000000-0000-0000-0000-000000000011'",&[]).await.unwrap();
         assert_eq!(row.get::<_, String>(0), "pending");
         assert_eq!(row.get::<_, i32>(1), 1);
         assert!(row.get::<_, bool>(2));
@@ -1238,7 +1160,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_file_is_not_materialized_or_leased() {
         let (_owned, mut client) = postgres().await;
-        legacy_fixture(&client).await;
+        file_fixture(&client).await;
         client
             .execute(
                 "UPDATE folder_a.file_contents SET data=convert_to(repeat('x',67108865),'UTF8')",
@@ -1252,7 +1174,7 @@ mod tests {
         );
         let row = client
             .query_one(
-                "SELECT status,attempts FROM folder_a.index_export_outbox",
+                "SELECT status,attempts FROM folder_a.index_export_intents",
                 &[],
             )
             .await
@@ -1266,11 +1188,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_legacy_ack_and_retry_cannot_modify_a_reclaimed_lease() {
+    async fn late_event_ack_and_retry_cannot_modify_a_reclaimed_lease() {
         let (_owned, mut client) = postgres().await;
-        legacy_fixture(&client).await;
+        file_fixture(&client).await;
         let first = claim(&mut client, "folder_a").await.unwrap().unwrap();
-        client.execute("UPDATE folder_a.index_export_outbox SET lease_expires_at=now()-interval '1 second'", &[]).await.unwrap();
+        client.execute("UPDATE folder_a.index_export_intents SET lease_expires_at=now()-interval '1 second'", &[]).await.unwrap();
         let next = claim(&mut client, "folder_a").await.unwrap().unwrap();
         assert!(
             acknowledge(&mut client, &first, "key", "old-version", &"33".repeat(32))
@@ -1303,13 +1225,13 @@ mod tests {
             CREATE TABLE entries(entry_id uuid PRIMARY KEY,state_hash bytea,content_hash bytea);
             CREATE TABLE file_contents(entry_id uuid PRIMARY KEY,data bytea);
             CREATE TABLE file_index_state(entry_id uuid PRIMARY KEY,desired_state_hash bytea,
-                desired_fingerprint bytea,active_state_hash bytea,active_fingerprint bytea);
+                desired_fingerprint bytea,active_state_hash bytea,active_fingerprint bytea,active_section_count bigint);
             CREATE TABLE file_semantic_state(entry_id uuid,embedding_profile_id text,
                 desired_state_hash bytea,desired_fingerprint bytea,PRIMARY KEY(entry_id,embedding_profile_id));
             INSERT INTO entries VALUES('00000000-0000-0000-0000-000000000001',decode(repeat('11',32),'hex'),decode(repeat('44',32),'hex'));
             INSERT INTO file_contents VALUES('00000000-0000-0000-0000-000000000001',decode('6162','hex'));
             INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,media_type)
-            VALUES('00000000-0000-0000-0000-000000000011','00000000-0000-0000-0000-000000000001',decode(repeat('11',32),'hex'),decode(repeat('22',32),'hex'),1,1,'file_content',decode(repeat('44',32),'hex'),decode(repeat('33',32),'hex'),'text/markdown');").await.unwrap();
+            VALUES('00000000-0000-0000-0000-000000000011','00000000-0000-0000-0000-000000000001',decode(repeat('11',32),'hex'),decode(repeat('22',32),'hex'),1,1,'file_content',decode(repeat('44',32),'hex'),decode(repeat('33',32),'hex'),'application/pdf');").await.unwrap();
     }
 
     async fn record_fixture(client: &tokio_postgres::Client) {
@@ -1326,8 +1248,8 @@ mod tests {
         let (_owned, mut client) = postgres().await;
         record_fixture(&client).await;
         client.batch_execute("UPDATE session_records SET raw_line=decode('0a','hex'),text='',byte_end=1,record_hash=sha256(int4send(21)||convert_to('lbfs-append-record-v1','UTF8')||int8send(1)||decode('0a','hex')); DELETE FROM index_export_intents; INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,media_type) SELECT gen_random_uuid(),entry_id,prefix_state_hash,record_hash,1,1,'record_content',record_hash,'application/x-ndjson' FROM session_records;").await.unwrap();
-        let (_obs, s3, mut config) = minio().await;
-        config.journal = true;
+        let (_obs, s3, config) = minio().await;
+
         let intent = claim_journal(&mut client, "folder_v2", &config)
             .await
             .unwrap()
@@ -1369,9 +1291,10 @@ mod tests {
             database_name: "test".into(),
             tenant_id: "test".into(),
             namespace_id: "lakebasefs".into(),
+            workspace_id: "ws-test".into(),
             source_generation: 1,
             source_config_version: 1,
-            journal: true,
+
             endpoint: "test".into(),
             region: "test".into(),
             bucket: "test".into(),
@@ -1384,23 +1307,19 @@ mod tests {
             client.batch_execute("UPDATE session_records SET raw_line=convert_to('record sentinel 雪'||chr(10),'UTF8'),text='record sentinel 雪'").await.unwrap();
             client.batch_execute(mutation).await.unwrap();
             client.batch_execute("UPDATE index_export_intents SET available_at=clock_timestamp()-interval '1 second'").await.unwrap();
-            assert!(
-                claim_journal(&mut client, "folder_v2", &config)
-                    .await
-                    .is_err()
-            );
+            assert!(claim_journal(&mut client, "folder_v2", &config)
+                .await
+                .is_err());
             let row=client.query_one("SELECT status,lease_token IS NULL,available_at>clock_timestamp() FROM index_export_intents",&[]).await.unwrap();
             assert_eq!(row.get::<_, String>(0), "pending");
             assert!(row.get::<_, bool>(1));
             assert!(row.get::<_, bool>(2));
         }
         client.batch_execute("INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,media_type) SELECT gen_random_uuid(),entry_id,source_state_hash,fingerprint,2,1,job_kind,content_hash,media_type FROM index_export_intents; INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,media_type) SELECT gen_random_uuid(),entry_id,source_state_hash,fingerprint,1,2,job_kind,content_hash,media_type FROM index_export_intents WHERE incarnation=1; DELETE FROM session_records;").await.unwrap();
-        assert!(
-            claim_journal(&mut client, "folder_v2", &config)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(claim_journal(&mut client, "folder_v2", &config)
+            .await
+            .unwrap()
+            .is_none());
         let rows=client.query("SELECT incarnation,source_config_version,status FROM index_export_intents ORDER BY incarnation,source_config_version",&[]).await.unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].get::<_, String>(2), "dead");
@@ -1413,8 +1332,8 @@ mod tests {
         let (_owned, mut client) = postgres().await;
         journal_fixture(&client).await;
         client.batch_execute("DELETE FROM index_export_intents; DELETE FROM entries; DROP TABLE file_contents,file_index_state,file_semantic_state; INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind) VALUES ('00000000-0000-0000-0000-000000000051','00000000-0000-0000-0000-000000000001',decode(repeat('11',32),'hex'),decode(repeat('22',32),'hex'),1,1,'tombstone');").await.unwrap();
-        let (_obs, s3, mut config) = minio().await;
-        config.journal = true;
+        let (_obs, s3, config) = minio().await;
+
         let intent = claim_journal(&mut client, "folder_v2", &config)
             .await
             .unwrap()
@@ -1430,12 +1349,10 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert!(
-            !object
-                .metadata()
-                .unwrap()
-                .contains_key("x-index-lexical-profile-hash")
-        );
+        assert!(!object
+            .metadata()
+            .unwrap()
+            .contains_key("x-index-lexical-profile-hash"));
         let bytes = object.body.collect().await.unwrap().into_bytes();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["schema"], "canonical-delete/v1");
@@ -1462,8 +1379,8 @@ mod tests {
     async fn record_intent_survives_later_appends_and_exports_without_file_relations() {
         let (_owned, mut client) = postgres().await;
         record_fixture(&client).await;
-        let (_obs, s3, mut config) = minio().await;
-        config.journal = true;
+        let (_obs, s3, config) = minio().await;
+
         let intent=claim_journal(&mut client,"folder_v2",&config).await.unwrap().expect("retained record prefix must export without file tables or a lexical section profile");
         let bytes = intent
             .payload
@@ -1490,12 +1407,10 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert!(
-            !actual
-                .metadata()
-                .unwrap()
-                .contains_key("x-index-lexical-profile-hash")
-        );
+        assert!(!actual
+            .metadata()
+            .unwrap()
+            .contains_key("x-index-lexical-profile-hash"));
         let actual = actual.body.collect().await.unwrap().into_bytes();
         assert_eq!(actual, bytes);
         acknowledge(&mut client, &intent, &receipt.0, &receipt.1, &receipt.2)
@@ -1522,9 +1437,10 @@ mod tests {
             database_name: "test".into(),
             tenant_id: "test".into(),
             namespace_id: "lakebasefs".into(),
+            workspace_id: "ws-test".into(),
             source_generation: 1,
             source_config_version: 1,
-            journal: true,
+
             endpoint: "test".into(),
             region: "test".into(),
             bucket: "test".into(),
@@ -1536,11 +1452,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            claim_journal(&mut client, "folder_v2", &config)
-                .await
-                .is_err()
-        );
+        assert!(claim_journal(&mut client, "folder_v2", &config)
+            .await
+            .is_err());
         let row = client
             .query_one("SELECT status,attempts FROM index_export_intents", &[])
             .await
@@ -1561,24 +1475,22 @@ mod tests {
             empty.payload.checksum,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
-        assert!(
-            empty
-                .payload
-                .body()
-                .await
-                .unwrap()
-                .collect()
-                .await
-                .unwrap()
-                .into_bytes()
-                .is_empty()
-        );
+        assert!(empty
+            .payload
+            .body()
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes()
+            .is_empty());
     }
 
     #[tokio::test]
     async fn schema_limit_file_is_exportable_without_a_whole_body_buffer() {
         let (_owned, mut client) = postgres().await;
-        legacy_fixture(&client).await;
+        file_fixture(&client).await;
         client
             .execute(
                 "UPDATE folder_a.file_contents SET data=convert_to(repeat('x',67108864),'UTF8')",
@@ -1610,9 +1522,10 @@ mod tests {
             database_name: "test".into(),
             tenant_id: "test-tenant".into(),
             namespace_id: "lakebasefs".into(),
+            workspace_id: "ws-test".into(),
             source_generation: 1,
             source_config_version: 1,
-            journal: true,
+
             endpoint: "test".into(),
             region: "test".into(),
             bucket: "test".into(),
@@ -1645,25 +1558,23 @@ mod tests {
         acknowledge(&mut client, &next, "key", "new-version", &"55".repeat(32))
             .await
             .unwrap();
-        assert!(
-            acknowledge(
-                &mut client,
-                &next,
-                "key",
-                "conflicting-version",
-                &"55".repeat(32)
-            )
-            .await
-            .is_err()
-        );
+        assert!(acknowledge(
+            &mut client,
+            &next,
+            "key",
+            "conflicting-version",
+            &"55".repeat(32)
+        )
+        .await
+        .is_err());
         let mut forged = next;
-        forged.event.as_mut().unwrap().fingerprint = "66".repeat(32);
+        forged.event.fingerprint = "66".repeat(32);
         assert!(
             acknowledge(&mut client, &forged, "key", "new-version", &"55".repeat(32))
                 .await
                 .is_err()
         );
-        forged.event.as_mut().unwrap().fingerprint = "22".repeat(32);
+        forged.event.fingerprint = "22".repeat(32);
         let old_source = source_id(&config, &forged);
         let old_key = object_key(&config, &forged, old_source);
         client
@@ -1683,7 +1594,7 @@ mod tests {
         );
         config.source_generation = 2;
         client.batch_execute("INSERT INTO index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,media_type)
-            VALUES('00000000-0000-0000-0000-000000000012','00000000-0000-0000-0000-000000000001',decode(repeat('11',32),'hex'),decode(repeat('22',32),'hex'),2,1,'file_content',decode(repeat('44',32),'hex'),decode(repeat('33',32),'hex'),'text/markdown');").await.unwrap();
+            VALUES('00000000-0000-0000-0000-000000000012','00000000-0000-0000-0000-000000000001',decode(repeat('11',32),'hex'),decode(repeat('22',32),'hex'),2,1,'file_content',decode(repeat('44',32),'hex'),decode(repeat('33',32),'hex'),'application/pdf');").await.unwrap();
         let restored = claim_journal(&mut client, "folder_v2", &config)
             .await
             .unwrap()
@@ -1697,22 +1608,18 @@ mod tests {
             .execute("UPDATE lbfs_export_config SET source_config_version=2", &[])
             .await
             .unwrap();
-        assert!(
-            acknowledge(
-                &mut client,
-                &restored,
-                "key",
-                "restored-version",
-                &"55".repeat(32)
-            )
+        assert!(acknowledge(
+            &mut client,
+            &restored,
+            "key",
+            "restored-version",
+            &"55".repeat(32)
+        )
+        .await
+        .is_err());
+        assert!(claim_journal(&mut client, "folder_v2", &config)
             .await
-            .is_err()
-        );
-        assert!(
-            claim_journal(&mut client, "folder_v2", &config)
-                .await
-                .is_err()
-        );
+            .is_err());
     }
 
     pub(super) async fn minio() -> (TestPostgres, aws_sdk_s3::Client, Config) {
@@ -1749,9 +1656,10 @@ mod tests {
             database_name: "test".into(),
             tenant_id: "test-tenant".into(),
             namespace_id: "lakebasefs".into(),
+            workspace_id: "ws-test".into(),
             source_generation: 1,
             source_config_version: 1,
-            journal: false,
+
             endpoint: format!("http://127.0.0.1:{port}"),
             region: "us-east-1".into(),
             bucket: "lbfs-export-test".into(),
@@ -1809,7 +1717,14 @@ mod tests {
             media_type: "text/markdown".into(),
             payload: test_spool(b"hello").await,
             lease_owner: Uuid::new_v4().to_string(),
-            event: None,
+            event: EventIdentity {
+                event_id: Uuid::new_v4().to_string(),
+                fingerprint: "22".repeat(32),
+                incarnation: 1,
+                source_config_version: 1,
+                job_kind: "file_content".into(),
+                content_hash: hex::encode(Sha256::digest(b"hello")),
+            },
         };
         let first = publish(&s3, &config, &intent).await.unwrap();
         let replay = publish(&s3, &config, &intent).await.unwrap();
@@ -1888,7 +1803,7 @@ mod tests {
         // Real PG -> multiple source chunks -> anonymous spool -> versioned
         // object readback -> exact lease ACK, without a test-only producer.
         let (_pg, mut client) = postgres().await;
-        legacy_fixture(&client).await;
+        file_fixture(&client).await;
         client
             .execute(
                 "UPDATE folder_a.file_contents SET data=convert_to(repeat('ab',1048583),'UTF8')",
@@ -1896,6 +1811,7 @@ mod tests {
             )
             .await
             .unwrap();
+        client.batch_execute("DELETE FROM folder_a.index_export_intents; UPDATE folder_a.entries SET content_hash=(SELECT sha256(data) FROM folder_a.file_contents LIMIT 1); INSERT INTO folder_a.index_export_intents(event_id,entry_id,source_state_hash,fingerprint,incarnation,source_config_version,job_kind,content_hash,lexical_profile_hash,media_type) SELECT '00000000-0000-0000-0000-000000000011',entry_id,state_hash,decode(repeat('22',32),'hex'),1,1,'file_content',content_hash,decode(repeat('33',32),'hex'),'application/pdf' FROM folder_a.entries;").await.unwrap();
         let large = claim(&mut client, "folder_a").await.unwrap().unwrap();
         assert_eq!(large.payload.len, 2097166);
         let uploaded = publish(&s3, &config, &large).await.unwrap();
@@ -1913,7 +1829,7 @@ mod tests {
             .unwrap();
         let receipt = client
             .query_one(
-                "SELECT status,object_version_id,object_checksum FROM folder_a.index_export_outbox",
+                "SELECT status,object_version_id,object_checksum FROM folder_a.index_export_intents",
                 &[],
             )
             .await
@@ -1924,14 +1840,14 @@ mod tests {
 
         let malformed = Intent {
             submission_id: "bad-source-checksum".into(),
-            event: Some(EventIdentity {
+            event: EventIdentity {
                 event_id: Uuid::new_v4().to_string(),
                 fingerprint: "22".repeat(32),
                 incarnation: 1,
                 source_config_version: 1,
                 job_kind: "file_content".into(),
                 content_hash: "00".repeat(32),
-            }),
+            },
             ..intent
         };
         assert!(
@@ -1957,9 +1873,10 @@ mod tests {
             database_name: "x".into(),
             tenant_id: "tenant-a".into(),
             namespace_id: "lakebasefs".into(),
+            workspace_id: "ws-test".into(),
             source_generation: 7,
             source_config_version: 1,
-            journal: false,
+
             endpoint: "x".into(),
             region: "x".into(),
             bucket: "x".into(),
@@ -1973,7 +1890,14 @@ mod tests {
             media_type: "text/markdown".into(),
             payload: test_spool(b"").await,
             lease_owner: Uuid::nil().to_string(),
-            event: None,
+            event: EventIdentity {
+                event_id: Uuid::new_v4().to_string(),
+                fingerprint: "22".repeat(32),
+                incarnation: 7,
+                source_config_version: 1,
+                job_kind: "file_content".into(),
+                content_hash: hex::encode(Sha256::digest(b"")),
+            },
         };
         assert!(object_key(&config, &intent, source).starts_with("index/v1/inputs/"));
         assert_eq!(object_key(&config, &intent, source).split('/').count(), 13);
