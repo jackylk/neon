@@ -4,6 +4,7 @@ pub mod inprocess;
 pub mod passthrough;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::FutureExt;
 use smol_str::ToSmolStr;
@@ -16,13 +17,21 @@ use crate::auth;
 use crate::cancellation::{self, CancellationHandler};
 use crate::config::{ProxyConfig, ProxyProtocolV2, TlsConfig};
 use crate::context::RequestContext;
+use crate::control_plane::messages::PoolerMode;
 use crate::error::{ReportableError, UserFacingError};
+use crate::lakeon_pooler::pool::{Checkout, CheckoutError, LakeonBackendPool};
+use crate::lakeon_pooler::session::LakeonPooledSession;
+use crate::lakeon_pooler::session::PooledBackend;
+use crate::lakeon_pooler::session::write_pooler_error_to_pq_stream;
 use crate::metrics::{Metrics, NumClientConnectionsGuard};
 pub use crate::pglb::copy_bidirectional::ErrorSource;
 use crate::pglb::handshake::{HandshakeData, HandshakeError, handshake};
 use crate::pglb::passthrough::ProxyPassthrough;
 use crate::protocol2::{ConnectHeader, ConnectionInfo, ConnectionInfoExtra, read_proxy_protocol};
-use crate::proxy::handle_client;
+use crate::proxy::{
+    authenticate_client, connect_authenticated_client, register_backend_cancel_key,
+    send_client_greeting,
+};
 use crate::rate_limiter::EndpointRateLimiter;
 use crate::stream::Stream;
 use crate::util::run_until_cancelled;
@@ -48,6 +57,9 @@ pub async fn task_main(
     cancellation_token: CancellationToken,
     cancellation_handler: Arc<CancellationHandler>,
     endpoint_rate_limiter: Arc<EndpointRateLimiter>,
+    lakeon_data_proxy: bool,
+    lakeon_pooler_max_backends_per_key: usize,
+    lakeon_pooler_queue_timeout: Duration,
 ) -> anyhow::Result<()> {
     scopeguard::defer! {
         info!("proxy has shut down");
@@ -59,6 +71,7 @@ pub async fn task_main(
 
     let connections = tokio_util::task::task_tracker::TaskTracker::new();
     let cancellations = tokio_util::task::task_tracker::TaskTracker::new();
+    let lakeon_backend_pool = Arc::new(LakeonBackendPool::new(lakeon_pooler_max_backends_per_key));
 
     while let Some(accept_result) =
         run_until_cancelled(listener.accept(), &cancellation_token).await
@@ -76,6 +89,7 @@ pub async fn task_main(
 
         debug!(protocol = "tcp", %session_id, "accepted new TCP connection");
         let endpoint_rate_limiter2 = endpoint_rate_limiter.clone();
+        let lakeon_backend_pool = lakeon_backend_pool.clone();
 
         connections.spawn(async move {
             let (socket, conn_info) = match config.proxy_protocol_v2 {
@@ -126,6 +140,9 @@ pub async fn task_main(
                 endpoint_rate_limiter2,
                 conn_gauge,
                 cancellations,
+                lakeon_data_proxy,
+                Some(lakeon_backend_pool.clone()),
+                lakeon_pooler_queue_timeout,
             )
             .instrument(ctx.span())
             .boxed()
@@ -203,6 +220,20 @@ impl ClientMode {
     }
 }
 
+pub(crate) enum ProxyConnection<S> {
+    Direct(ProxyPassthrough<S>),
+    LakeonPooled(LakeonPooledSession<S>),
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> ProxyConnection<S> {
+    pub(crate) async fn proxy_pass(self) -> Result<(), ErrorSource> {
+        match self {
+            Self::Direct(p) => p.proxy_pass().await,
+            Self::LakeonPooled(p) => p.proxy_pass().await,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 // almost all errors should be reported to the user, but there's a few cases where we cannot
 // 1. Cancellation: we are not allowed to tell the client any cancellation statuses for security reasons
@@ -245,7 +276,10 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     endpoint_rate_limiter: Arc<EndpointRateLimiter>,
     conn_gauge: NumClientConnectionsGuard<'static>,
     cancellations: tokio_util::task::task_tracker::TaskTracker,
-) -> Result<Option<ProxyPassthrough<S>>, ClientRequestError> {
+    lakeon_data_proxy: bool,
+    lakeon_backend_pool: Option<Arc<LakeonBackendPool>>,
+    lakeon_pooler_queue_timeout: Duration,
+) -> Result<Option<ProxyConnection<S>>, ClientRequestError> {
     debug!(
         protocol = %ctx.protocol(),
         "handling interactive connection from client"
@@ -296,11 +330,10 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
     let common_names = tls.map(|tls| &tls.common_names);
 
-    let (node, cancel_on_shutdown) = handle_client(
+    let authenticated = authenticate_client(
         config,
         auth_backend,
         ctx,
-        cancellation_handler,
         &mut client,
         &mode,
         endpoint_rate_limiter,
@@ -309,7 +342,14 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     )
     .await?;
 
-    let client = client.flush_and_into_inner().await?;
+    let lakeon_pool_key = if lakeon_data_proxy && authenticated.is_lakeon_pooler_endpoint() {
+        authenticated.lakeon_pool_key(params.get("database").unwrap_or_default())
+    } else {
+        None
+    };
+    if let Some(pool_key) = &lakeon_pool_key {
+        debug!(?pool_key, "Lakeon pooled endpoint selected");
+    }
 
     let private_link_id = match ctx.extra() {
         Some(ConnectionInfoExtra::Aws { vpce_id }) => Some(vpce_id.clone()),
@@ -317,17 +357,148 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
         None => None,
     };
 
-    Ok(Some(ProxyPassthrough {
-        client,
-        compute: node.stream.into_framed().into_inner(),
+    let lakeon_new_backend_reserved = if let (Some(pool_key), Some(pool)) =
+        (&lakeon_pool_key, &lakeon_backend_pool)
+    {
+        match pool
+            .checkout_or_reserve(pool_key, lakeon_pooler_queue_timeout)
+            .await
+        {
+            Ok(Checkout::Idle(backend)) => {
+                send_client_greeting(ctx, &config.greetings, &mut client);
+                let (cancel_key_data, cancel_on_shutdown) = register_backend_cancel_key(
+                    config,
+                    ctx,
+                    cancellation_handler,
+                    backend.cancel_info.clone(),
+                );
+                backend
+                    .startup_replay
+                    .write_to(&mut client, cancel_key_data);
+                let client = client.flush_and_into_inner().await?;
+                return Ok(Some(ProxyConnection::LakeonPooled(LakeonPooledSession {
+                    client,
+                    aux: backend.aux.clone(),
+                    backend: Some(backend),
+                    pool: pool.clone(),
+                    pool_key: pool_key.clone(),
+                    private_link_id,
+                    _cancel_on_shutdown: cancel_on_shutdown,
+                    _req: request_gauge,
+                    _conn: conn_gauge,
+                })));
+            }
+            Ok(Checkout::ReservedNew) => true,
+            Err(CheckoutError::QueueTimeout) => {
+                let stats = pool.stats().await;
+                Metrics::get().proxy.lakeon_pooler_queue_timeout_total.inc();
+                warn!(
+                    ?pool_key,
+                    pools = stats.pools,
+                    checked_out = stats.checked_out,
+                    idle = stats.idle,
+                    total = stats.total,
+                    queue_timeout_ms = lakeon_pooler_queue_timeout.as_millis(),
+                    "Lakeon pooled endpoint timed out waiting for a backend connection"
+                );
+                send_client_greeting(ctx, &config.greetings, &mut client);
+                write_pooler_error_to_pq_stream(
+                        &mut client,
+                        "Lakeon pooled endpoint waited for a backend connection but timed out; retry later or use the direct endpoint",
+                    )
+                    .await?;
+                return Ok(None);
+            }
+            Err(CheckoutError::PoolFull) => {
+                let stats = pool.stats().await;
+                Metrics::get().proxy.lakeon_pooler_full_total.inc();
+                warn!(
+                    ?pool_key,
+                    pools = stats.pools,
+                    checked_out = stats.checked_out,
+                    idle = stats.idle,
+                    total = stats.total,
+                    "Lakeon pooled endpoint reached per-proxy backend limit"
+                );
+                send_client_greeting(ctx, &config.greetings, &mut client);
+                write_pooler_error_to_pq_stream(
+                    &mut client,
+                    "Lakeon pooled endpoint has reached the per-proxy backend connection limit; retry later or use the direct endpoint",
+                )
+                .await?;
+                return Ok(None);
+            }
+        }
+    } else {
+        false
+    };
 
-        aux: node.aux,
-        private_link_id,
+    let connected = match connect_authenticated_client(
+        config,
+        ctx,
+        cancellation_handler,
+        &mut client,
+        authenticated,
+    )
+    .await
+    {
+        Ok(connected) => connected,
+        Err(e) => {
+            if lakeon_new_backend_reserved
+                && let (Some(pool_key), Some(pool)) = (&lakeon_pool_key, &lakeon_backend_pool)
+            {
+                pool.release_checked_out(pool_key).await;
+            }
+            return Err(e.into());
+        }
+    };
+    let node = connected.node;
+    let cancel_on_shutdown = connected.cancel_on_shutdown;
 
-        _cancel_on_shutdown: cancel_on_shutdown,
+    let client = client.flush_and_into_inner().await?;
 
-        _req: request_gauge,
-        _conn: conn_gauge,
-        _db_conn: node.guage,
-    }))
+    let pooled = lakeon_pool_key.is_some() && node.aux.pooler_mode == PoolerMode::ProxyPooled;
+    if pooled {
+        let pool = lakeon_backend_pool.expect("Lakeon pooled endpoint requires backend pool");
+        let pool_key = lakeon_pool_key.expect("pooled endpoint has a pool key");
+        let aux = node.aux.clone();
+        Ok(Some(ProxyConnection::LakeonPooled(LakeonPooledSession {
+            client,
+            backend: Some(PooledBackend {
+                compute: node.stream.into_framed().into_inner(),
+                startup_replay: connected.startup_replay,
+                cancel_info: connected.cancel_info,
+                aux: aux.clone(),
+                _db_conn: node.guage,
+            }),
+            pool,
+            pool_key,
+            aux,
+            private_link_id,
+
+            _cancel_on_shutdown: cancel_on_shutdown,
+
+            _req: request_gauge,
+            _conn: conn_gauge,
+        })))
+    } else {
+        if lakeon_new_backend_reserved
+            && let (Some(pool_key), Some(pool)) = (&lakeon_pool_key, &lakeon_backend_pool)
+        {
+            pool.release_checked_out(pool_key).await;
+        }
+        Ok(Some(ProxyConnection::Direct(ProxyPassthrough {
+            client,
+            compute: node.stream.into_framed().into_inner(),
+
+            aux: node.aux,
+            private_link_id,
+
+            _cancel_on_shutdown: cancel_on_shutdown,
+
+            _req: request_gauge,
+            _conn: conn_gauge,
+            _db_conn: node.guage,
+        })))
+    }
 }

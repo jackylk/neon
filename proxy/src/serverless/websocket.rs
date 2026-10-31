@@ -153,6 +153,9 @@ pub(crate) async fn serve_websocket(
         endpoint_rate_limiter,
         conn_gauge,
         cancellations,
+        false,
+        None,
+        std::time::Duration::ZERO,
     ))
     .await;
 

@@ -195,6 +195,7 @@ impl MockControlPlane {
                 branch_id: (&BranchId::from("branch")).into(),
                 compute_id: "compute".into(),
                 cold_start_info: crate::control_plane::messages::ColdStartInfo::Warm,
+                pooler_mode: crate::control_plane::messages::PoolerMode::Direct,
             },
         };
 

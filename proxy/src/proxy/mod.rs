@@ -8,6 +8,7 @@ pub(crate) mod wake_compute;
 
 use std::collections::HashSet;
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures::TryStreamExt;
@@ -28,6 +29,7 @@ use crate::cancellation::{CancelClosure, CancellationHandler};
 use crate::compute::{ComputeConnection, PostgresError, RustlsStream};
 use crate::config::ProxyConfig;
 use crate::context::RequestContext;
+use crate::lakeon_pooler::pool::PoolKey;
 pub use crate::pglb::copy_bidirectional::{ErrorSource, copy_bidirectional_client_compute};
 use crate::pglb::{ClientMode, ClientRequestError};
 use crate::pqproto::{BeMessage, CancelKeyData, StartupMessageParams};
@@ -36,18 +38,98 @@ use crate::stream::{PqStream, Stream};
 use crate::types::EndpointCacheKey;
 use crate::{auth, compute};
 
+pub(crate) struct AuthenticatedClient<'a> {
+    backend: auth::Backend<'a, auth::backend::ComputeUserInfo>,
+    auth_info: compute::AuthInfo,
+}
+
+impl AuthenticatedClient<'_> {
+    pub(crate) fn is_lakeon_pooler_endpoint(&self) -> bool {
+        match &self.backend {
+            auth::Backend::ControlPlane(_, user_info) => {
+                user_info.endpoint.as_ref().ends_with("-pooler")
+            }
+            auth::Backend::Local(_) => false,
+        }
+    }
+
+    pub(crate) fn lakeon_pool_key(&self, database: &str) -> Option<PoolKey> {
+        match &self.backend {
+            auth::Backend::ControlPlane(_, user_info) => Some(PoolKey::new(
+                user_info.endpoint.normalize().as_ref(),
+                "",
+                database,
+                user_info.user.as_ref(),
+            )),
+            auth::Backend::Local(_) => None,
+        }
+    }
+}
+
+pub(crate) struct ConnectedClient {
+    pub(crate) node: ComputeConnection,
+    pub(crate) cancel_on_shutdown: oneshot::Sender<Infallible>,
+    pub(crate) startup_replay: StartupReplay,
+    pub(crate) cancel_info: BackendCancelInfo,
+}
+
+#[derive(Clone)]
+pub(crate) struct BackendCancelInfo {
+    pub(crate) socket_addr: SocketAddr,
+    pub(crate) cancel_token: RawCancelToken,
+    pub(crate) hostname: String,
+    pub(crate) user_info: auth::backend::ComputeUserInfo,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StartupReplay {
+    frames: Vec<StartupReplayFrame>,
+}
+
+#[derive(Debug, Clone)]
+enum StartupReplayFrame {
+    Raw { tag: u8, body: Vec<u8> },
+    BackendKeyData,
+}
+
+impl StartupReplay {
+    fn push_raw(&mut self, tag: u8, body: Vec<u8>) {
+        self.frames.push(StartupReplayFrame::Raw { tag, body });
+    }
+
+    fn push_backend_key_data(&mut self) {
+        self.frames.push(StartupReplayFrame::BackendKeyData);
+    }
+
+    pub(crate) fn write_to(
+        &self,
+        client: &mut PqStream<impl AsyncRead + AsyncWrite + Unpin>,
+        cancel_key_data: CancelKeyData,
+    ) {
+        for frame in &self.frames {
+            match frame {
+                StartupReplayFrame::Raw { tag, body } => {
+                    client.write_raw(body.len(), *tag, |buf| buf.extend_from_slice(body));
+                }
+                StartupReplayFrame::BackendKeyData => {
+                    client.write_message(BeMessage::BackendKeyData(cancel_key_data));
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send>(
+pub(crate) async fn authenticate_client<'a, S: AsyncRead + AsyncWrite + Unpin + Send>(
     config: &'static ProxyConfig,
-    auth_backend: &'static auth::Backend<'static, ()>,
+    auth_backend: &'a auth::Backend<'static, ()>,
     ctx: &RequestContext,
-    cancellation_handler: Arc<CancellationHandler>,
     client: &mut PqStream<Stream<S>>,
     mode: &ClientMode,
     endpoint_rate_limiter: Arc<EndpointRateLimiter>,
     common_names: Option<&HashSet<String>>,
     params: &StartupMessageParams,
-) -> Result<(ComputeConnection, oneshot::Sender<Infallible>), ClientRequestError> {
+) -> Result<AuthenticatedClient<'a>, ClientRequestError> {
     let hostname = mode.hostname(client.get_ref());
     // Extract credentials which we're going to use for auth.
     let result = auth_backend
@@ -94,12 +176,21 @@ pub(crate) async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
     let backend = auth::Backend::ControlPlane(cplane, creds.info);
 
-    // TODO: callback to pglb
+    Ok(AuthenticatedClient { backend, auth_info })
+}
+
+pub(crate) async fn connect_authenticated_client<S: AsyncRead + AsyncWrite + Unpin>(
+    config: &'static ProxyConfig,
+    ctx: &RequestContext,
+    cancellation_handler: Arc<CancellationHandler>,
+    client: &mut PqStream<Stream<S>>,
+    authenticated: AuthenticatedClient<'_>,
+) -> Result<ConnectedClient, ClientRequestError> {
     let res = connect_auth::connect_to_compute_and_auth(
         ctx,
         config,
-        &backend,
-        auth_info,
+        &authenticated.backend,
+        authenticated.auth_info,
         connect_compute::TlsNegotiation::Postgres,
     )
     .await;
@@ -111,16 +202,54 @@ pub(crate) async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
     send_client_greeting(ctx, &config.greetings, client);
 
-    let auth::Backend::ControlPlane(_, user_info) = backend else {
+    let auth::Backend::ControlPlane(_, user_info) = authenticated.backend else {
         unreachable!("ensured above");
     };
 
     let session = cancellation_handler.get_key();
+    let cancel_key_data = *session.key();
 
-    let (process_id, secret_key) =
-        forward_compute_params_to_client(ctx, *session.key(), client, &mut node.stream).await?;
-    let hostname = node.hostname.to_string();
+    let (process_id, secret_key, startup_replay) =
+        forward_compute_params_to_client(ctx, cancel_key_data, client, &mut node.stream).await?;
+    let cancel_info = BackendCancelInfo {
+        socket_addr: node.socket_addr,
+        cancel_token: RawCancelToken {
+            ssl_mode: node.ssl_mode,
+            process_id,
+            secret_key,
+        },
+        hostname: node.hostname.to_string(),
+        user_info,
+    };
+    let cancel_on_shutdown =
+        spawn_cancel_key_maintenance(config, ctx, session, cancel_info.clone());
 
+    Ok(ConnectedClient {
+        node,
+        cancel_on_shutdown,
+        startup_replay,
+        cancel_info,
+    })
+}
+
+pub(crate) fn register_backend_cancel_key(
+    config: &'static ProxyConfig,
+    ctx: &RequestContext,
+    cancellation_handler: Arc<CancellationHandler>,
+    cancel_info: BackendCancelInfo,
+) -> (CancelKeyData, oneshot::Sender<Infallible>) {
+    let session = cancellation_handler.get_key();
+    let cancel_key_data = *session.key();
+    let cancel_on_shutdown = spawn_cancel_key_maintenance(config, ctx, session, cancel_info);
+    (cancel_key_data, cancel_on_shutdown)
+}
+
+fn spawn_cancel_key_maintenance(
+    config: &'static ProxyConfig,
+    ctx: &RequestContext,
+    session: crate::cancellation::Session,
+    cancel_info: BackendCancelInfo,
+) -> oneshot::Sender<Infallible> {
     let session_id = ctx.session_id();
     let (cancel_on_shutdown, cancel) = oneshot::channel();
     tokio::spawn(async move {
@@ -129,21 +258,16 @@ pub(crate) async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 session_id,
                 cancel,
                 &CancelClosure {
-                    socket_addr: node.socket_addr,
-                    cancel_token: RawCancelToken {
-                        ssl_mode: node.ssl_mode,
-                        process_id,
-                        secret_key,
-                    },
-                    hostname,
-                    user_info,
+                    socket_addr: cancel_info.socket_addr,
+                    cancel_token: cancel_info.cancel_token,
+                    hostname: cancel_info.hostname,
+                    user_info: cancel_info.user_info,
                 },
                 &config.connect_to_compute,
             )
             .await;
     });
-
-    Ok((node, cancel_on_shutdown))
+    cancel_on_shutdown
 }
 
 /// Greet the client with any useful information.
@@ -194,9 +318,10 @@ pub(crate) async fn forward_compute_params_to_client(
     cancel_key_data: CancelKeyData,
     client: &mut PqStream<impl AsyncRead + AsyncWrite + Unpin>,
     compute: &mut StartupStream<TcpStream, RustlsStream>,
-) -> Result<(i32, i32), ClientRequestError> {
+) -> Result<(i32, i32, StartupReplay), ClientRequestError> {
     let mut process_id = 0;
     let mut secret_key = 0;
+    let mut startup_replay = StartupReplay::default();
 
     let err = loop {
         // if the client buffer is too large, let's write out some bytes now to save some space
@@ -211,6 +336,7 @@ pub(crate) async fn forward_compute_params_to_client(
             // Send our cancellation key data instead.
             Some(Message::BackendKeyData(body)) => {
                 client.write_message(BeMessage::BackendKeyData(cancel_key_data));
+                startup_replay.push_backend_key_data();
                 process_id = body.process_id();
                 secret_key = body.secret_key();
             }
@@ -223,6 +349,12 @@ pub(crate) async fn forward_compute_params_to_client(
                         name: name.as_bytes(),
                         value: value.as_bytes(),
                     });
+                    let mut replay_body = Vec::with_capacity(name.len() + value.len() + 2);
+                    replay_body.extend_from_slice(name.as_bytes());
+                    replay_body.push(0);
+                    replay_body.extend_from_slice(value.as_bytes());
+                    replay_body.push(0);
+                    startup_replay.push_raw(b'S', replay_body);
                 }
             }
             // Forward all notices to the client.
@@ -230,10 +362,12 @@ pub(crate) async fn forward_compute_params_to_client(
                 client.write_raw(notice.as_bytes().len(), b'N', |buf| {
                     buf.extend_from_slice(notice.as_bytes());
                 });
+                startup_replay.push_raw(b'N', notice.as_bytes().to_vec());
             }
             Some(Message::ReadyForQuery(_)) => {
                 client.write_message(BeMessage::ReadyForQuery);
-                return Ok((process_id, secret_key));
+                startup_replay.push_raw(b'Z', vec![b'I']);
+                return Ok((process_id, secret_key, startup_replay));
             }
             Some(Message::ErrorResponse(body)) => break postgres_client::Error::db(body),
             Some(_) => break postgres_client::Error::unexpected_message(),

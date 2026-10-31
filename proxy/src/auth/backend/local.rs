@@ -43,6 +43,7 @@ impl LocalBackend {
                     branch_id: BranchIdTag::get_interner().get_or_intern("local"),
                     compute_id: "local".into(),
                     cold_start_info: ColdStartInfo::WarmCached,
+                    pooler_mode: crate::control_plane::messages::PoolerMode::Direct,
                 },
             },
         }
