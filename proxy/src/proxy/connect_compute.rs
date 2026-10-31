@@ -143,6 +143,9 @@ pub(crate) async fn connect_to_compute_inner<M: ConnectMechanism, B: WakeCompute
                 },
                 num_retries.into(),
             );
+            if err.should_retry_wake_compute() {
+                user_info.report_connect_failure();
+            }
             return Err(err);
         }
         node_info
@@ -184,6 +187,9 @@ pub(crate) async fn connect_to_compute_inner<M: ConnectMechanism, B: WakeCompute
                         },
                         num_retries.into(),
                     );
+                    if e.should_retry_wake_compute() {
+                        user_info.report_connect_failure();
+                    }
                     return Err(e);
                 }
 

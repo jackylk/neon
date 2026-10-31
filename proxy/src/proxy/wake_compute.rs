@@ -25,6 +25,7 @@ macro_rules! log_wake_compute_error {
 
 #[async_trait]
 pub(crate) trait WakeComputeBackend {
+    fn report_connect_failure(&self) {}
     async fn wake_compute(&self, ctx: &RequestContext) -> Result<CachedNodeInfo, WakeComputeError>;
 }
 

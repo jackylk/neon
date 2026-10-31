@@ -587,6 +587,7 @@ fn helper_create_connect_info(
     auth::Backend::ControlPlane(
         MaybeOwned::Owned(ControlPlaneClient::Test(Box::new(mechanism.clone()))),
         ComputeUserInfo {
+            prefetched_node: Default::default(),
             endpoint: "endpoint".into(),
             user: "user".into(),
             options: NeonOptions::parse_options_raw(""),
@@ -852,4 +853,55 @@ async fn retry_cold_wake_skips_invalidation() {
         .await
         .unwrap();
     mechanism.verify();
+}
+
+#[test]
+fn read_only_route_option_is_not_ephemeral_and_partitions_cache() {
+    let ro = super::NeonOptions::parse_options_raw("neon_read_only:true");
+    assert!(ro.read_only().unwrap());
+    assert!(!ro.is_ephemeral());
+    assert_ne!(
+        ro.get_cache_key("db"),
+        super::NeonOptions::default().get_cache_key("db")
+    );
+    assert!(
+        super::NeonOptions::parse_options_raw("neon_read_only:false")
+            .read_only()
+            .is_ok_and(|v| !v)
+    );
+}
+
+#[test]
+fn invalid_or_duplicate_read_only_option_is_rejected() {
+    assert!(
+        super::NeonOptions::parse_options_raw("neon_read_only:yes")
+            .read_only()
+            .is_err()
+    );
+    assert!(
+        super::NeonOptions::parse_options_raw("neon_read_only:true neon_read_only:false")
+            .read_only()
+            .is_err()
+    );
+}
+
+#[test]
+fn client_cannot_supply_internal_route_generation() {
+    assert!(
+        super::NeonOptions::parse_options_raw(
+            "neon_read_only:true neon_read_route_generation:fake-pod"
+        )
+        .validate_read_only_startup()
+        .is_err()
+    );
+    assert!(
+        super::NeonOptions::parse_options_raw("neon_read_route_generation:fake-pod")
+            .validate_read_only_startup()
+            .is_err()
+    );
+    assert!(
+        super::NeonOptions::parse_options_raw("neon_read_only:true")
+            .validate_read_only_startup()
+            .unwrap()
+    );
 }

@@ -330,7 +330,7 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
     let common_names = tls.map(|tls| &tls.common_names);
 
-    let authenticated = authenticate_client(
+    let mut authenticated = authenticate_client(
         config,
         auth_backend,
         ctx,
@@ -341,6 +341,10 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
         &params,
     )
     .await?;
+
+    if let Err(error) = authenticated.resolve_read_only(ctx).await {
+        return Err(client.throw_error(error, Some(ctx)).await.into());
+    }
 
     let lakeon_pool_key = if lakeon_data_proxy && authenticated.is_lakeon_pooler_endpoint() {
         authenticated.lakeon_pool_key(params.get("database").unwrap_or_default())

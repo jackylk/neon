@@ -149,7 +149,7 @@ pub(crate) struct AuthInfo {
 }
 
 /// Contains only the data needed to establish a secure connection to compute.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ConnectInfo {
     pub host_addr: Option<IpAddr>,
     pub host: Host,
@@ -221,8 +221,12 @@ impl AuthInfo {
         if !arbitrary_params {
             self.server_params.insert("client_encoding", "UTF8");
         }
+        let read_only = crate::proxy::NeonOptions::parse_params(params)
+            .read_only()
+            .unwrap_or(false);
         for (k, v) in params.iter() {
             match k {
+                "default_transaction_read_only" if read_only => {}
                 // Only set `user` if it's not present in the config.
                 // Console redirect auth flow takes username from the console's response.
                 "user" | "database" if self.skip_db_user => {}
@@ -242,6 +246,10 @@ impl AuthInfo {
                 }
                 _ => {}
             }
+        }
+        if read_only {
+            self.server_params
+                .insert("default_transaction_read_only", "on");
         }
     }
 
@@ -419,5 +427,35 @@ mod tests {
 
         let params = "project = foo neon_endpoint_type:read_write   neon_lsn:0/2 neon_proxy_params_compat:true";
         assert_eq!(filtered_options(params).as_deref(), Some("project = foo"));
+    }
+    #[test]
+    fn read_only_startup_default_is_applied_and_proxy_options_are_consumed() {
+        for arbitrary in [false, true] {
+            let mut auth = AuthInfo::for_console_redirect("db", "user", None);
+            let mut params = StartupMessageParams::default();
+            params.insert(
+                "options",
+                "endpoint=db neon_read_only:true -c search_path=public",
+            );
+            params.insert("default_transaction_read_only", "off");
+            auth.set_startup_params(&params, arbitrary);
+            assert_eq!(
+                auth.server_params.get("default_transaction_read_only"),
+                Some("on")
+            );
+            let options = auth.server_params.get("options").unwrap();
+            assert!(!options.contains("neon_read_only"));
+            assert!(options.contains("search_path=public"));
+        }
+    }
+
+    #[test]
+    fn regular_startup_does_not_acquire_read_only_default() {
+        let mut auth = AuthInfo::for_console_redirect("db", "user", None);
+        auth.set_startup_params(&StartupMessageParams::default(), false);
+        assert_eq!(
+            auth.server_params.get("default_transaction_read_only"),
+            None
+        );
     }
 }

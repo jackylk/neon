@@ -80,6 +80,7 @@ pub(crate) async fn password_hack_no_authentication(
     // Report tentative success; compute node will check the password anyway.
     Ok((
         ComputeUserInfo {
+            prefetched_node: Default::default(),
             user: info.user,
             options: info.options,
             endpoint: payload.endpoint,

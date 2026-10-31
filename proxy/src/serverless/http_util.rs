@@ -263,6 +263,7 @@ pub(crate) fn get_conn_info(
     );
 
     let user_info = ComputeUserInfo {
+        prefetched_node: Default::default(),
         endpoint,
         user: username,
         options: options.unwrap_or_default(),

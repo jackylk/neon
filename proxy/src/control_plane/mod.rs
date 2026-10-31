@@ -3,6 +3,7 @@
 
 /// Payloads used in the console's APIs.
 pub mod messages;
+pub(crate) mod read_pool;
 
 /// Wrappers for console APIs and their mocks.
 pub mod client;
@@ -63,7 +64,7 @@ pub(crate) struct AuthInfo {
 }
 
 /// Info for establishing a connection to a compute node.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct NodeInfo {
     pub(crate) conn_info: compute::ConnectInfo,
 

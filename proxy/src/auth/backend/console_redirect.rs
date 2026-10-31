@@ -202,6 +202,7 @@ async fn authenticate(
 
     let user: RoleName = db_info.user.into();
     let user_info = ComputeUserInfo {
+        prefetched_node: Default::default(),
         endpoint: db_info.aux.endpoint_id.as_str().into(),
         user: user.clone(),
         options: NeonOptions::default(),

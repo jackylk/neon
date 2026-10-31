@@ -239,6 +239,7 @@ mod tests {
         let pool = GlobalConnPool::new(config);
         let conn_info = ConnInfo {
             user_info: ComputeUserInfo {
+                prefetched_node: Default::default(),
                 user: "user".into(),
                 endpoint: "endpoint".into(),
                 options: NeonOptions::default(),
@@ -290,6 +291,7 @@ mod tests {
 
         let conn_info = ConnInfo {
             user_info: ComputeUserInfo {
+                prefetched_node: Default::default(),
                 user: "user".into(),
                 endpoint: "endpoint-2".into(),
                 options: NeonOptions::default(),

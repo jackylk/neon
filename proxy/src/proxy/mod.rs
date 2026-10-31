@@ -44,6 +44,16 @@ pub(crate) struct AuthenticatedClient<'a> {
 }
 
 impl AuthenticatedClient<'_> {
+    pub(crate) async fn resolve_read_only(
+        &mut self,
+        ctx: &RequestContext,
+    ) -> Result<(), crate::control_plane::errors::WakeComputeError> {
+        if let auth::Backend::ControlPlane(api, user_info) = &mut self.backend {
+            api.resolve_read_only(ctx, user_info).await?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn is_lakeon_pooler_endpoint(&self) -> bool {
         match &self.backend {
             auth::Backend::ControlPlane(_, user_info) => {
@@ -56,7 +66,10 @@ impl AuthenticatedClient<'_> {
     pub(crate) fn lakeon_pool_key(&self, database: &str) -> Option<PoolKey> {
         match &self.backend {
             auth::Backend::ControlPlane(_, user_info) => Some(PoolKey::new(
-                user_info.endpoint.normalize().as_ref(),
+                user_info
+                    .options
+                    .get_cache_key(user_info.endpoint.normalize().as_ref())
+                    .as_ref(),
                 "",
                 database,
                 user_info.user.as_ref(),
@@ -389,6 +402,9 @@ impl NeonOptions {
     /// `PARAMS_COMPAT` allows opting in to forwarding all startup parameters from client to compute.
     pub const PARAMS_COMPAT: &'static str = "proxy_params_compat";
 
+    pub const READ_ONLY: &'static str = "read_only";
+    pub const READ_ROUTE_GENERATION: &'static str = "read_route_generation";
+
     // cplane options:
 
     /// `LSN` allows provisioning an ephemeral compute with time-travel to the provided LSN.
@@ -418,10 +434,45 @@ impl NeonOptions {
             .cloned()
     }
 
+    /// A route hint, never an authorization grant. Reject ambiguous input before routing.
+    pub(crate) fn read_only(&self) -> Result<bool, std::io::Error> {
+        let values: Vec<_> = self
+            .0
+            .iter()
+            .filter(|(k, _)| k == Self::READ_ONLY)
+            .collect();
+        match values.as_slice() {
+            [] => Ok(false),
+            [(_, value)] if value == "true" => Ok(true),
+            [(_, value)] if value == "false" => Ok(false),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "neon_read_only must occur once with true or false",
+            )),
+        }
+    }
+
+    pub(crate) fn validate_read_only_startup(&self) -> Result<bool, std::io::Error> {
+        if self.get(Self::READ_ROUTE_GENERATION).is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "read route generation is proxy-internal",
+            ));
+        }
+        self.read_only()
+    }
+
+    pub(crate) fn set_route_generation(&mut self, generation: &str) {
+        self.0.retain(|(key, _)| key != Self::READ_ROUTE_GENERATION);
+        self.0
+            .push((Self::READ_ROUTE_GENERATION.into(), generation.into()));
+        self.0.sort();
+    }
+
     pub(crate) fn is_ephemeral(&self) -> bool {
         self.0.iter().any(|(k, _)| match &**k {
             // This is not a cplane option, we know it does not create ephemeral computes.
-            Self::PARAMS_COMPAT => false,
+            Self::PARAMS_COMPAT | Self::READ_ONLY | Self::READ_ROUTE_GENERATION => false,
             Self::LSN => true,
             Self::TIMESTAMP => true,
             Self::ENDPOINT_TYPE => true,

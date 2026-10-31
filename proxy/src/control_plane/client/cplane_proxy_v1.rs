@@ -25,6 +25,7 @@ use crate::control_plane::errors::{
 };
 use crate::control_plane::locks::ApiLocks;
 use crate::control_plane::messages::{ColdStartInfo, EndpointJwksResponse};
+use crate::control_plane::read_pool::{MAX_READ_CANDIDATES, ReadPool, ReadPoolRouter};
 use crate::control_plane::{
     AccessBlockerFlags, AuthInfo, AuthSecret, EndpointAccessControl, NodeInfo, RoleAccessControl,
 };
@@ -44,6 +45,7 @@ pub struct NeonControlPlaneClient {
     pub(crate) wake_compute_endpoint_rate_limiter: Arc<WakeComputeRateLimiter>,
     // put in a shared ref so we don't copy secrets all over in memory
     jwt: Arc<str>,
+    read_pool: Arc<ReadPoolRouter>,
 }
 
 impl NeonControlPlaneClient {
@@ -61,7 +63,98 @@ impl NeonControlPlaneClient {
             locks,
             wake_compute_endpoint_rate_limiter,
             jwt,
+            read_pool: Arc::new(ReadPoolRouter::new()),
         }
+    }
+
+    pub(crate) fn report_read_failure(&self, info: &ComputeUserInfo) {
+        if info.options.read_only().unwrap_or(false) {
+            if let Some(generation) = info
+                .options
+                .get(crate::proxy::NeonOptions::READ_ROUTE_GENERATION)
+            {
+                self.read_pool
+                    .mark_failed(info.endpoint.normalize().as_ref(), &generation);
+            }
+        }
+    }
+
+    /// Selection and wake precede checkout, so pooled reuse also touches the selected endpoint.
+    pub(crate) async fn resolve_read_only(
+        &self,
+        ctx: &RequestContext,
+        user_info: &mut ComputeUserInfo,
+    ) -> Result<(), WakeComputeError> {
+        let original = user_info.clone();
+        let mut excluded = std::collections::BTreeSet::new();
+        for _ in 0..MAX_READ_CANDIDATES + 2 {
+            let request = self
+                .endpoint
+                .get_path("read_pool")
+                .header("Authorization", format!("Bearer {}", &self.jwt))
+                .query(&[
+                    ("endpointish", original.endpoint.as_str()),
+                    (
+                        "exclude",
+                        excluded
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(",")
+                            .as_str(),
+                    ),
+                ])
+                .query(&[("session_id", ctx.session_id())])
+                .build()?;
+            let response = self.endpoint.execute(request).await?;
+            let pool = parse_body::<ReadPool>(response.status(), response.bytes().await?)?;
+            let selected = match self.read_pool.select(&pool) {
+                Ok(selected) => selected,
+                Err(e) if e.kind() == std::io::ErrorKind::NotConnected => {
+                    excluded.extend(self.read_pool.failed_ids(&pool));
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let mut target = original.clone();
+            let pooled = original.endpoint.as_str().ends_with("-pooler");
+            target.endpoint = format!(
+                "{}{}",
+                selected.endpoint_id,
+                if pooled { "-pooler" } else { "" }
+            )
+            .into();
+            target.options.set_route_generation(&selected.generation);
+            if !self
+                .wake_compute_endpoint_rate_limiter
+                .check(target.endpoint.normalize_intern(), 1)
+            {
+                return Err(WakeComputeError::TooManyConnections);
+            }
+            match self.do_wake_compute(ctx, &target).await {
+                Ok(node) => {
+                    ctx.set_project(node.aux.clone());
+                    *target
+                        .prefetched_node
+                        .lock()
+                        .map_err(|_| std::io::Error::other("read handoff lock poisoned"))? =
+                        Some(node);
+                    *user_info = target;
+                    return Ok(());
+                }
+                Err(WakeComputeError::ControlPlane(ControlPlaneError::Message(error)))
+                    if selected.endpoint_id.starts_with("ep_")
+                        && (error.http_status_code.is_server_error()
+                            || matches!(error.http_status_code.as_u16(), 404 | 409)) =>
+                {
+                    self.read_pool
+                        .mark_failed(&selected.endpoint_id, &selected.generation);
+                    excluded.insert(selected.endpoint_id);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::other("read route selection exhausted").into())
     }
 
     pub(crate) fn url(&self) -> &str {
@@ -411,6 +504,26 @@ impl super::ControlPlaneApi for NeonControlPlaneClient {
         ctx: &RequestContext,
         user_info: &ComputeUserInfo,
     ) -> Result<CachedNodeInfo, WakeComputeError> {
+        if user_info.options.read_only()? {
+            let node = user_info
+                .prefetched_node
+                .lock()
+                .map_err(|_| std::io::Error::other("read handoff lock poisoned"))?
+                .take();
+            if let Some(node) = node {
+                return Ok(Cached::new_uncached(node));
+            }
+            // A per-endpoint cached address must not skip selected endpoint activity/readiness checks.
+            if !self
+                .wake_compute_endpoint_rate_limiter
+                .check(user_info.endpoint.normalize_intern(), 1)
+            {
+                return Err(WakeComputeError::TooManyConnections);
+            }
+            let node = self.do_wake_compute(ctx, user_info).await?;
+            ctx.set_project(node.aux.clone());
+            return Ok(Cached::new_uncached(node));
+        }
         let key = user_info.endpoint_cache_key();
 
         macro_rules! check_cache {

@@ -156,6 +156,8 @@ pub(crate) struct ComputeUserInfoNoEndpoint {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct ComputeUserInfo {
+    #[serde(skip)]
+    pub(crate) prefetched_node: Arc<std::sync::Mutex<Option<control_plane::NodeInfo>>>,
     pub(crate) endpoint: EndpointId,
     pub(crate) user: RoleName,
     pub(crate) options: NeonOptions,
@@ -184,6 +186,7 @@ impl TryFrom<ComputeUserInfoMaybeEndpoint> for ComputeUserInfo {
                 options: user_info.options,
             }),
             Some(endpoint) => Ok(ComputeUserInfo {
+                prefetched_node: Default::default(),
                 endpoint,
                 user: user_info.user,
                 options: user_info.options,
@@ -406,6 +409,11 @@ impl Backend<'_, ComputeUserInfo> {
 
 #[async_trait::async_trait]
 impl WakeComputeBackend for Backend<'_, ComputeUserInfo> {
+    fn report_connect_failure(&self) {
+        if let Self::ControlPlane(api, info) = self {
+            api.report_read_failure(info);
+        }
+    }
     async fn wake_compute(
         &self,
         ctx: &RequestContext,

@@ -37,6 +37,32 @@ pub enum ControlPlaneClient {
     Test(Box<dyn TestControlPlaneClient>),
 }
 
+impl ControlPlaneClient {
+    pub(crate) fn report_read_failure(&self, info: &ComputeUserInfo) {
+        match self {
+            Self::ProxyV1(api) => api.report_read_failure(info),
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
+    }
+    pub(crate) async fn resolve_read_only(
+        &self,
+        ctx: &RequestContext,
+        user_info: &mut ComputeUserInfo,
+    ) -> Result<(), errors::WakeComputeError> {
+        if !user_info.options.validate_read_only_startup()? {
+            return Ok(());
+        }
+        match self {
+            Self::ProxyV1(api) => api.resolve_read_only(ctx, user_info).await,
+            #[allow(unreachable_patterns)]
+            _ => {
+                Err(std::io::Error::other("read routing requires the control-plane backend").into())
+            }
+        }
+    }
+}
+
 impl ControlPlaneApi for ControlPlaneClient {
     async fn get_role_access_control(
         &self,

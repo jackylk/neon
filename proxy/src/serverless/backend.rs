@@ -239,6 +239,7 @@ impl PoolingBackend {
         tracing::Span::current().record("conn_id", display(conn_id));
         debug!(%conn_id, "pool: opening a new connection '{conn_info}'");
         let backend = self.auth_backend.as_ref().map(|()| ComputeUserInfo {
+            prefetched_node: Default::default(),
             user: conn_info.user_info.user.clone(),
             endpoint: EndpointId::from(format!(
                 "{}{LOCAL_PROXY_SUFFIX}",
