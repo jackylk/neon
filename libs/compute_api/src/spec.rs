@@ -223,9 +223,10 @@ pub struct ComputeSpec {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LakeonIndexExportSpec {
     pub tenant_id: String,
+    pub workspace_id: String,
     pub namespace_id: String,
     pub source_generation: u64,
-    /// Absent means the existing outbox protocol. Switching requires source reconciliation.
+    /// LakebaseFS only accepts event-v2; all scope fields are required by the exporter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1380,6 +1380,7 @@ dependencies = [
  "sha2",
  "signal-hook",
  "tar",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-postgres",
