@@ -347,7 +347,7 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     }
 
     let lakeon_pool_key = if lakeon_data_proxy && authenticated.is_lakeon_pooler_endpoint() {
-        authenticated.lakeon_pool_key(params.get("database").unwrap_or_default())
+        authenticated.lakeon_pool_key(&params)
     } else {
         None
     };

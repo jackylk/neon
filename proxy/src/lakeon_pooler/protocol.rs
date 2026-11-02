@@ -20,6 +20,7 @@ impl BackendTransactionStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FrontendAction {
     SimpleQuery,
+    ExtendedProtocol,
     StartsTransaction,
     EndsTransaction,
     FlushesTransactionBoundary,
@@ -56,7 +57,20 @@ impl<'a> FrontendMessage<'a> {
             b'Q' => classify_simple_query(self.body),
             b'S' => FrontendAction::FlushesTransactionBoundary,
             b'X' => FrontendAction::Terminate,
-            b'P' | b'B' | b'D' | b'E' | b'H' => FrontendAction::SimpleQuery,
+            b'P' => {
+                let mut fields = self.body.split(|b| *b == 0);
+                let _name = fields.next();
+                match fields.next() {
+                    Some(sql)
+                        if classify_simple_query(sql)
+                            != FrontendAction::UnsupportedSessionState =>
+                    {
+                        FrontendAction::ExtendedProtocol
+                    }
+                    _ => FrontendAction::UnsupportedSessionState,
+                }
+            }
+            b'B' | b'D' | b'E' | b'H' | b'C' => FrontendAction::ExtendedProtocol,
             b'd' | b'c' | b'f' => FrontendAction::UnsupportedSessionState,
             _ => FrontendAction::UnsupportedSessionState,
         }

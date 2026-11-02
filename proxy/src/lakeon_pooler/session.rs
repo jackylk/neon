@@ -44,7 +44,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> LakeonPooledSession<S> {
         );
         let mut backend = self.backend.take().expect("pooled backend is present");
         let result = proxy_transaction_aware(self.client, &mut backend.compute).await;
-        if matches!(result, Ok(BackendTransactionStatus::Idle)) {
+        if matches!(result, Ok(BackendTransactionStatus::Idle))
+            && reset_backend(&mut backend.compute).await.is_ok()
+        {
             self.pool.release_idle(self.pool_key, backend).await;
         } else {
             self.pool.release_checked_out(&self.pool_key).await;
@@ -61,11 +63,39 @@ pub(crate) struct PooledBackend {
     pub(crate) _db_conn: NumDbConnectionsGuard<'static>,
 }
 
+async fn reset_backend(compute: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> io::Result<()> {
+    compute
+        .write_all(
+            &PgFrame {
+                tag: b'Q',
+                body: b"DISCARD ALL\0".to_vec(),
+            }
+            .to_wire(),
+        )
+        .await?;
+    compute.flush().await?;
+    let mut failed = false;
+    loop {
+        let frame = read_frame(compute).await?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "backend closed during reset")
+        })?;
+        failed |= frame.tag == b'E';
+        if let Some(status) = frame.ready_for_query_status() {
+            return if !failed && status == b'I' {
+                Ok(())
+            } else {
+                Err(io::Error::other("backend reset failed"))
+            };
+        }
+    }
+}
+
 async fn proxy_transaction_aware(
     mut client: impl AsyncRead + AsyncWrite + Unpin,
     mut compute: impl AsyncRead + AsyncWrite + Unpin,
 ) -> Result<BackendTransactionStatus, ErrorSource> {
     let mut last_status = BackendTransactionStatus::Idle;
+    let mut extended_failed = false;
     loop {
         let Some(frontend) = read_frame(&mut client).await.map_err(ErrorSource::Client)? else {
             return Ok(last_status);
@@ -89,9 +119,42 @@ async fn proxy_transaction_aware(
                 )
                 .await
                 .map_err(ErrorSource::Client)?;
+                if frontend.tag == b'P' {
+                    // A locally rejected Parse never reached PostgreSQL. Closing prevents
+                    // pipelined Bind/Execute from running a previous unnamed statement.
+                    return Err(ErrorSource::Client(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "unsupported pooled Parse; use the direct endpoint",
+                    )));
+                }
                 continue;
             }
+            FrontendAction::ExtendedProtocol => {
+                compute
+                    .write_all(&frontend.to_wire())
+                    .await
+                    .map_err(ErrorSource::Compute)?;
+                if frontend.tag != b'H' && !extended_failed {
+                    // Parsing/binding can require a reply before the client sends Sync. Flush is
+                    // not a transaction boundary; never wait for ReadyForQuery at these stages.
+                    last_status = BackendTransactionStatus::Unknown;
+                    compute
+                        .write_all(
+                            &PgFrame {
+                                tag: b'H',
+                                body: vec![],
+                            }
+                            .to_wire(),
+                        )
+                        .await
+                        .map_err(ErrorSource::Compute)?;
+                    compute.flush().await.map_err(ErrorSource::Compute)?;
+                    extended_failed =
+                        forward_extended_reply(&mut compute, &mut client, frontend.tag).await?;
+                }
+            }
             FrontendAction::FlushesTransactionBoundary => {
+                extended_failed = false;
                 compute
                     .write_all(&frontend.to_wire())
                     .await
@@ -107,6 +170,38 @@ async fn proxy_transaction_aware(
                     .map_err(ErrorSource::Compute)?;
                 last_status = forward_backend_until_ready(&mut compute, &mut client).await?;
             }
+        }
+    }
+}
+
+async fn forward_extended_reply(
+    compute: &mut (impl AsyncRead + Unpin),
+    client: &mut (impl AsyncWrite + Unpin),
+    request: u8,
+) -> Result<bool, ErrorSource> {
+    loop {
+        let Some(frame) = read_frame(compute).await.map_err(ErrorSource::Compute)? else {
+            return Err(ErrorSource::Compute(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "compute closed during extended query",
+            )));
+        };
+        let complete = frame.tag == b'E'
+            || match request {
+                b'P' => frame.tag == b'1',
+                b'B' => frame.tag == b'2',
+                b'D' => matches!(frame.tag, b'T' | b'n'),
+                b'E' => matches!(frame.tag, b'C' | b's' | b'I'),
+                b'C' => frame.tag == b'3',
+                _ => false,
+            };
+        client
+            .write_all(&frame.to_wire())
+            .await
+            .map_err(ErrorSource::Client)?;
+        client.flush().await.map_err(ErrorSource::Client)?;
+        if complete {
+            return Ok(frame.tag == b'E');
         }
     }
 }
@@ -215,4 +310,123 @@ pub(crate) async fn write_pooler_error_to_pq_stream<S: AsyncWrite + Unpin>(
     });
     client.write_raw(1, b'Z', |buf| buf.push(b'I'));
     client.flush().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn rejected_parse_never_executes_previous_statement() {
+        let (mut client, proxy_client) = tokio::io::duplex(4096);
+        let (proxy_compute, mut server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(proxy_transaction_aware(proxy_client, proxy_compute));
+        for (tag, body) in [
+            (b'P', b"\0SET timezone='UTC'\0\0\0".to_vec()),
+            (b'B', vec![]),
+            (b'E', vec![]),
+            (b'S', vec![]),
+        ] {
+            client
+                .write_all(&PgFrame { tag, body }.to_wire())
+                .await
+                .unwrap();
+        }
+        assert!(
+            timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(read_frame(&mut server).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_flush_is_answered_before_frontend_sync() {
+        let (mut client, proxy_client) = tokio::io::duplex(4096);
+        let (proxy_compute, mut server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(proxy_transaction_aware(proxy_client, proxy_compute));
+        let backend = tokio::spawn(async move {
+            assert_eq!(read_frame(&mut server).await.unwrap().unwrap().tag, b'P');
+            assert_eq!(read_frame(&mut server).await.unwrap().unwrap().tag, b'H');
+            server
+                .write_all(
+                    &PgFrame {
+                        tag: b'1',
+                        body: vec![],
+                    }
+                    .to_wire(),
+                )
+                .await
+                .unwrap();
+            loop {
+                let f = read_frame(&mut server).await.unwrap().unwrap();
+                if f.tag == b'S' {
+                    server
+                        .write_all(
+                            &PgFrame {
+                                tag: b'Z',
+                                body: vec![b'I'],
+                            }
+                            .to_wire(),
+                        )
+                        .await
+                        .unwrap();
+                    break;
+                }
+                assert_eq!(f.tag, b'H');
+            }
+        });
+        client
+            .write_all(
+                &PgFrame {
+                    tag: b'P',
+                    body: b"\0SELECT $1::int\0\0\0".to_vec(),
+                }
+                .to_wire(),
+            )
+            .await
+            .unwrap();
+        client
+            .write_all(
+                &PgFrame {
+                    tag: b'H',
+                    body: vec![],
+                }
+                .to_wire(),
+            )
+            .await
+            .unwrap();
+        let reply = timeout(Duration::from_millis(250), read_frame(&mut client))
+            .await
+            .expect("Parse/Flush deadlocked waiting for frontend Sync")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.tag, b'1');
+        client
+            .write_all(
+                &PgFrame {
+                    tag: b'S',
+                    body: vec![],
+                }
+                .to_wire(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_frame(&mut client).await.unwrap().unwrap().tag, b'Z');
+        client
+            .write_all(
+                &PgFrame {
+                    tag: b'X',
+                    body: vec![],
+                }
+                .to_wire(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), BackendTransactionStatus::Idle);
+        backend.await.unwrap();
+    }
 }

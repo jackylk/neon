@@ -13,6 +13,7 @@ pub(crate) struct PoolKey {
     branch_id: String,
     database: String,
     role: String,
+    startup_params: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -78,12 +79,26 @@ impl Default for LakeonBackendPool {
 }
 
 impl PoolKey {
+    pub(crate) fn with_startup_params(
+        mut self,
+        params: &crate::pqproto::StartupMessageParams,
+    ) -> Self {
+        self.startup_params = params
+            .iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        // Stable sorting retains order for repeated keys, whose values can be order-sensitive.
+        self.startup_params.sort_by(|a, b| a.0.cmp(&b.0));
+        self
+    }
+
     pub(crate) fn new(endpoint_id: &str, branch_id: &str, database: &str, role: &str) -> Self {
         Self {
             endpoint_id: endpoint_id.to_owned(),
             branch_id: branch_id.to_owned(),
             database: database.to_owned(),
             role: role.to_owned(),
+            startup_params: Vec::new(),
         }
     }
 }
@@ -418,5 +433,27 @@ mod tests {
         assert_eq!(stats.idle, 1);
         assert_eq!(stats.checked_out, 1);
         assert_eq!(stats.total, 2);
+    }
+    #[test]
+    fn backend_pool_keys_partition_startup_defaults() {
+        use crate::pqproto::StartupMessageParams;
+        let key = PoolKey::new("ep", "branch", "db", "role");
+        let a = StartupMessageParams::new([
+            ("options", "-c timezone=UTC"),
+            ("client_encoding", "UTF8"),
+        ]);
+        let reordered = StartupMessageParams::new([
+            ("client_encoding", "UTF8"),
+            ("options", "-c timezone=UTC"),
+        ]);
+        let b = StartupMessageParams::new([("options", "-c timezone=Asia/Shanghai")]);
+        assert_eq!(
+            key.clone().with_startup_params(&a),
+            key.clone().with_startup_params(&reordered)
+        );
+        assert_ne!(
+            key.clone().with_startup_params(&a),
+            key.with_startup_params(&b)
+        );
     }
 }

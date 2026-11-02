@@ -63,17 +63,20 @@ impl AuthenticatedClient<'_> {
         }
     }
 
-    pub(crate) fn lakeon_pool_key(&self, database: &str) -> Option<PoolKey> {
+    pub(crate) fn lakeon_pool_key(&self, params: &StartupMessageParams) -> Option<PoolKey> {
         match &self.backend {
-            auth::Backend::ControlPlane(_, user_info) => Some(PoolKey::new(
-                user_info
-                    .options
-                    .get_cache_key(user_info.endpoint.normalize().as_ref())
-                    .as_ref(),
-                "",
-                database,
-                user_info.user.as_ref(),
-            )),
+            auth::Backend::ControlPlane(_, user_info) => Some(
+                PoolKey::new(
+                    user_info
+                        .options
+                        .get_cache_key(user_info.endpoint.normalize().as_ref())
+                        .as_ref(),
+                    "",
+                    params.get("database").unwrap_or_default(),
+                    user_info.user.as_ref(),
+                )
+                .with_startup_params(params),
+            ),
             auth::Backend::Local(_) => None,
         }
     }
