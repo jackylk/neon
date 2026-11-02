@@ -435,7 +435,7 @@ mod tests {
             let mut params = StartupMessageParams::default();
             params.insert(
                 "options",
-                "endpoint=db neon_read_only:true -c search_path=public",
+                "endpoint=db read_only=true -c search_path=public",
             );
             params.insert("default_transaction_read_only", "off");
             auth.set_startup_params(&params, arbitrary);
@@ -444,7 +444,7 @@ mod tests {
                 Some("on")
             );
             let options = auth.server_params.get("options").unwrap();
-            assert!(!options.contains("neon_read_only"));
+            assert!(!options.contains("read_only"));
             assert!(options.contains("search_path=public"));
         }
     }

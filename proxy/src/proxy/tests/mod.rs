@@ -857,7 +857,7 @@ async fn retry_cold_wake_skips_invalidation() {
 
 #[test]
 fn read_only_route_option_is_not_ephemeral_and_partitions_cache() {
-    let ro = super::NeonOptions::parse_options_raw("neon_read_only:true");
+    let ro = super::NeonOptions::parse_options_raw("read_only=true");
     assert!(ro.read_only().unwrap());
     assert!(!ro.is_ephemeral());
     assert_ne!(
@@ -865,7 +865,7 @@ fn read_only_route_option_is_not_ephemeral_and_partitions_cache() {
         super::NeonOptions::default().get_cache_key("db")
     );
     assert!(
-        super::NeonOptions::parse_options_raw("neon_read_only:false")
+        super::NeonOptions::parse_options_raw("read_only=false")
             .read_only()
             .is_ok_and(|v| !v)
     );
@@ -874,12 +874,12 @@ fn read_only_route_option_is_not_ephemeral_and_partitions_cache() {
 #[test]
 fn invalid_or_duplicate_read_only_option_is_rejected() {
     assert!(
-        super::NeonOptions::parse_options_raw("neon_read_only:yes")
+        super::NeonOptions::parse_options_raw("read_only=yes")
             .read_only()
             .is_err()
     );
     assert!(
-        super::NeonOptions::parse_options_raw("neon_read_only:true neon_read_only:false")
+        super::NeonOptions::parse_options_raw("read_only=true read_only=false")
             .read_only()
             .is_err()
     );
@@ -888,11 +888,9 @@ fn invalid_or_duplicate_read_only_option_is_rejected() {
 #[test]
 fn client_cannot_supply_internal_route_generation() {
     assert!(
-        super::NeonOptions::parse_options_raw(
-            "neon_read_only:true neon_read_route_generation:fake-pod"
-        )
-        .validate_read_only_startup()
-        .is_err()
+        super::NeonOptions::parse_options_raw("read_only=true neon_read_route_generation:fake-pod")
+            .validate_read_only_startup()
+            .is_err()
     );
     assert!(
         super::NeonOptions::parse_options_raw("neon_read_route_generation:fake-pod")
@@ -900,7 +898,7 @@ fn client_cannot_supply_internal_route_generation() {
             .is_err()
     );
     assert!(
-        super::NeonOptions::parse_options_raw("neon_read_only:true")
+        super::NeonOptions::parse_options_raw("read_only=true")
             .validate_read_only_startup()
             .unwrap()
     );

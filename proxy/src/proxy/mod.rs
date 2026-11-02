@@ -450,7 +450,7 @@ impl NeonOptions {
             [(_, value)] if value == "false" => Ok(false),
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "neon_read_only must occur once with true or false",
+                "read_only must occur once with true or false",
             )),
         }
     }
@@ -514,6 +514,9 @@ impl NeonOptions {
 }
 
 pub(crate) fn neon_option(bytes: &str) -> Option<(&str, &str)> {
+    if let Some(value) = bytes.strip_prefix("read_only=") {
+        return Some((NeonOptions::READ_ONLY, value));
+    }
     static RE: OnceCell<Regex> = OnceCell::new();
     let re = RE.get_or_init(|| Regex::new(r"^neon_(\w+):(.+)").expect("regex should be correct"));
 
