@@ -231,7 +231,7 @@ def test_wal_restore_http(neon_env_builder: NeonEnvBuilder, broken_tenant: bool)
 #     test_creator = "test_creator"
 #     test_metastore_id = uuid4()
 #     test_account_id = uuid4()
-#     test_workspace_id = 1
+#     test_fs_id = 1
 #     test_workspace_url = "http://test_workspace_url"
 #     test_metadata_version = 1
 #     test_metadata = {
@@ -262,14 +262,14 @@ def test_wal_restore_http(neon_env_builder: NeonEnvBuilder, broken_tenant: bool)
 #         test_creator,
 #         test_metastore_id,
 #         test_account_id,
-#         test_workspace_id,
+#         test_fs_id,
 #         test_workspace_url,
 #         test_instance_read_write_compute_pool_1,
 #         test_metadata_version,
 #         test_metadata,
 #         test_instance_1_readable_secondaries_enabled,
 #     )
-#     instance = env.compute_manager.get_instance_by_name(test_instance_name_1, test_workspace_id)
+#     instance = env.compute_manager.get_instance_by_name(test_instance_name_1, test_fs_id)
 #     log.info(f"haoyu Instance created: {instance}")
 #     assert instance["instance_name"] == test_instance_name_1
 #     test_instance_id = instance["instance_id"]

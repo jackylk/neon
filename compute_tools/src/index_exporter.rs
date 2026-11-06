@@ -23,7 +23,7 @@ struct Config {
     database_name: String,
     tenant_id: String,
     namespace_id: String,
-    workspace_id: String,
+    fs_id: String,
     source_generation: u64,
     source_config_version: u64,
 
@@ -282,14 +282,14 @@ async fn defer_materialization(
 }
 
 fn validate_assignment(export: &compute_api::spec::LakeonIndexExportSpec) -> Result<(u64, u64)> {
-    if export.workspace_id.is_empty()
-        || export.workspace_id.len() > 64
+    if export.fs_id.is_empty()
+        || export.fs_id.len() > 64
         || !export
-            .workspace_id
+            .fs_id
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
         || export.protocol.as_deref() != Some("event-v2")
-        || export.workspace_incarnation != Some(export.source_generation)
+        || export.fs_incarnation != Some(export.source_generation)
         || export.source_generation == 0
         || export.source_generation > i64::MAX as u64
         || export
@@ -336,7 +336,7 @@ impl Config {
             database_name,
             tenant_id: export.tenant_id.clone(),
             namespace_id: export.namespace_id.clone(),
-            workspace_id: export.workspace_id.clone(),
+            fs_id: export.fs_id.clone(),
             source_generation,
             source_config_version,
 
@@ -508,7 +508,7 @@ fn source_id(config: &Config, intent: &Intent) -> Uuid {
         &config.tenant_id,
         &format!(
             "{}:{}:incarnation:{}",
-            config.workspace_id, intent.schema, intent.event.incarnation
+            config.fs_id, intent.schema, intent.event.incarnation
         ),
     )
 }
@@ -916,7 +916,7 @@ mod tests {
             database_name: "test".into(),
             tenant_id: "test".into(),
             namespace_id: "lakebasefs".into(),
-            workspace_id: "ws-test".into(),
+            fs_id: "ws-test".into(),
             source_generation: 1,
             source_config_version: 1,
             endpoint: "unused".into(),
@@ -928,13 +928,13 @@ mod tests {
 
     #[test]
     fn only_explicit_event_v2_assignments_are_accepted() {
-        let base = serde_json::json!({"tenant_id":"tenant-a","namespace_id":"lakebasefs","workspace_id":"ws-a","source_generation":7,
-            "protocol":"event-v2","workspace_incarnation":7,"source_config_version":1});
+        let base = serde_json::json!({"tenant_id":"tenant-a","namespace_id":"lakebasefs","fs_id":"ws-a","source_generation":7,
+            "protocol":"event-v2","fs_incarnation":7,"source_config_version":1});
         let parse = |value| {
             serde_json::from_value::<compute_api::spec::LakeonIndexExportSpec>(value).unwrap()
         };
         assert_eq!(validate_assignment(&parse(base.clone())).unwrap(), (7, 1));
-        for field in ["protocol", "workspace_incarnation", "source_config_version"] {
+        for field in ["protocol", "fs_incarnation", "source_config_version"] {
             let mut absent = base.clone();
             absent.as_object_mut().unwrap().remove(field);
             assert!(validate_assignment(&parse(absent)).is_err());
@@ -945,7 +945,7 @@ mod tests {
             assert!(validate_assignment(&parse(value)).is_err());
         }
         let mut stale = base;
-        stale["workspace_incarnation"] = serde_json::json!(8);
+        stale["fs_incarnation"] = serde_json::json!(8);
         assert!(validate_assignment(&parse(stale)).is_err());
     }
 
@@ -1091,7 +1091,7 @@ mod tests {
             database_name: "test".into(),
             tenant_id: "test".into(),
             namespace_id: "lakebasefs".into(),
-            workspace_id: "ws-test".into(),
+            fs_id: "ws-test".into(),
             source_generation: 1,
             source_config_version: 1,
 
@@ -1313,7 +1313,7 @@ mod tests {
             database_name: "test".into(),
             tenant_id: "test".into(),
             namespace_id: "lakebasefs".into(),
-            workspace_id: "ws-test".into(),
+            fs_id: "ws-test".into(),
             source_generation: 1,
             source_config_version: 1,
 
@@ -1459,7 +1459,7 @@ mod tests {
             database_name: "test".into(),
             tenant_id: "test".into(),
             namespace_id: "lakebasefs".into(),
-            workspace_id: "ws-test".into(),
+            fs_id: "ws-test".into(),
             source_generation: 1,
             source_config_version: 1,
 
@@ -1544,7 +1544,7 @@ mod tests {
             database_name: "test".into(),
             tenant_id: "test-tenant".into(),
             namespace_id: "lakebasefs".into(),
-            workspace_id: "ws-test".into(),
+            fs_id: "ws-test".into(),
             source_generation: 1,
             source_config_version: 1,
 
@@ -1678,7 +1678,7 @@ mod tests {
             database_name: "test".into(),
             tenant_id: "test-tenant".into(),
             namespace_id: "lakebasefs".into(),
-            workspace_id: "ws-test".into(),
+            fs_id: "ws-test".into(),
             source_generation: 1,
             source_config_version: 1,
 
@@ -1895,7 +1895,7 @@ mod tests {
             database_name: "x".into(),
             tenant_id: "tenant-a".into(),
             namespace_id: "lakebasefs".into(),
-            workspace_id: "ws-test".into(),
+            fs_id: "ws-test".into(),
             source_generation: 7,
             source_config_version: 1,
 

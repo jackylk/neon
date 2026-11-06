@@ -6,7 +6,7 @@ fn config() -> Config {
         database_name: "test".into(),
         tenant_id: "test".into(),
         namespace_id: "lakebasefs".into(),
-        workspace_id: "ws-test".into(),
+        fs_id: "ws-test".into(),
         source_generation: 1,
         source_config_version: 1,
 

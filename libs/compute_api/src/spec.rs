@@ -223,14 +223,14 @@ pub struct ComputeSpec {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LakeonIndexExportSpec {
     pub tenant_id: String,
-    pub workspace_id: String,
+    pub fs_id: String,
     pub namespace_id: String,
     pub source_generation: u64,
     /// LakebaseFS only accepts event-v2; all scope fields are required by the exporter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_incarnation: Option<u64>,
+    pub fs_incarnation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_config_version: Option<u64>,
 }
@@ -695,6 +695,22 @@ mod tests {
     use std::fs::File;
 
     use super::*;
+
+    #[test]
+    fn lakebasefs_export_uses_fs_identity_without_workspace_alias() {
+        let value = serde_json::json!({
+            "tenant_id": "tenant-a", "fs_id": "ws-existing", "namespace_id": "lakebasefs",
+            "source_generation": 7, "protocol": "event-v2", "fs_incarnation": 7,
+            "source_config_version": 1
+        });
+        let spec: LakeonIndexExportSpec = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(spec.fs_id, "ws-existing");
+        assert_eq!(spec.fs_incarnation, Some(7));
+        assert_eq!(serde_json::to_value(spec).unwrap(), value);
+        let mut old = value;
+        old["workspace_id"] = old.as_object_mut().unwrap().remove("fs_id").unwrap();
+        assert!(serde_json::from_value::<LakeonIndexExportSpec>(old).is_err());
+    }
 
     #[test]
     fn allow_installing_remote_extensions() {
