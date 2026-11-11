@@ -96,6 +96,13 @@ pub struct ProxyMetrics {
     /// Number of Lakeon pooled TCP connections rejected because the per-proxy pool is full.
     pub lakeon_pooler_full_total: Counter,
 
+    /// TCP/WS clients rejected by the per-process pre-authentication budget.
+    pub preauth_global_rejected_total: Counter,
+    /// TCP/WS clients rejected by the source IP pre-authentication budget.
+    pub preauth_source_rejected_total: Counter,
+    /// Connections that exhausted the transport header deadline.
+    pub preauth_timeout_total: Counter,
+
     /// Number of Lakeon pooled TCP connections rejected after waiting for a backend too long.
     pub lakeon_pooler_queue_timeout_total: Counter,
 

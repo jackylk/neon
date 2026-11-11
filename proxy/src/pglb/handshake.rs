@@ -195,6 +195,12 @@ pub(crate) async fn handshake<S: AsyncRead + AsyncWrite + Unpin + Send>(
             FeStartupPacket::StartupMessage { params, version }
                 if version.major() == 3 && version > PG_PROTOCOL_LATEST =>
             {
+                // Protocol negotiation must enforce the same TLS policy as 3.0.
+                // Returning Startup here without this check permits plaintext 3.1
+                // clients to bypass the normal startup branch.
+                if tls.is_some() {
+                    Err(stream.throw_error(TlsRequired, None).await)?;
+                }
                 debug!(?version, "unsupported minor version");
 
                 // no protocol extensions are supported.

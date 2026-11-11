@@ -251,6 +251,27 @@ async fn handshake_tls_is_enforced_by_proxy() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn plaintext_protocol_negotiation_cannot_bypass_tls() -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    for version in [196608_u32, 196609, 196617] {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (_, tls) = generate_tls_config("generic-project-name.localhost", "localhost")?;
+        let task = tokio::spawn(dummy_proxy(server, Some(tls), NoAuth));
+        let mut payload = version.to_be_bytes().to_vec();
+        payload.extend_from_slice(b"user\0john\0database\0earth\0\0");
+        client.write_u32((payload.len() + 4) as u32).await?;
+        client.write_all(&payload).await?;
+        assert_eq!(client.read_u8().await?, b'E');
+        let len = client.read_u32().await? as usize;
+        let mut error = vec![0; len - 4];
+        client.read_exact(&mut error).await?;
+        assert!(String::from_utf8_lossy(&error).contains(ERR_INSECURE_CONNECTION));
+        assert!(task.await?.is_err());
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn handshake_tls() -> anyhow::Result<()> {
     let (client, server) = tokio::io::duplex(1024);
 

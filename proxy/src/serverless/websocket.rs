@@ -135,7 +135,19 @@ pub(crate) async fn serve_websocket(
     hostname: Option<String>,
     cancellations: tokio_util::task::task_tracker::TaskTracker,
 ) -> anyhow::Result<()> {
-    let websocket = websocket.await?;
+    let mut permit = config.admission.try_acquire().ok_or_else(|| {
+        Metrics::get().proxy.preauth_global_rejected_total.inc();
+        anyhow::anyhow!("pre-authentication capacity exhausted")
+    })?;
+    anyhow::ensure!(permit.assign_source(ctx.peer_addr()), {
+        Metrics::get().proxy.preauth_source_rejected_total.inc();
+        "source pre-authentication capacity exhausted"
+    });
+    let websocket = tokio::time::timeout_at(
+        permit.started + config.handshake_timeout.min(config.authentication_timeout),
+        websocket,
+    )
+    .await??;
     let websocket = WebSocketServer::after_handshake(TokioIo::new(websocket));
 
     let conn_gauge = Metrics::get()
@@ -156,6 +168,7 @@ pub(crate) async fn serve_websocket(
         false,
         None,
         std::time::Duration::ZERO,
+        permit,
     ))
     .await;
 

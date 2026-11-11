@@ -77,6 +77,12 @@ pub async fn task_main(
         run_until_cancelled(listener.accept(), &cancellation_token).await
     {
         let (socket, peer_addr) = accept_result?;
+        // Admit before spawning or allocating per-client tasks. Closing the socket
+        // immediately keeps rejected work bounded even during a connection flood.
+        let Some(mut permit) = config.admission.try_acquire() else {
+            Metrics::get().proxy.preauth_global_rejected_total.inc();
+            continue;
+        };
 
         let conn_gauge = Metrics::get()
             .proxy
@@ -94,17 +100,29 @@ pub async fn task_main(
         connections.spawn(async move {
             let (socket, conn_info) = match config.proxy_protocol_v2 {
                 ProxyProtocolV2::Required => {
-                    match read_proxy_protocol(socket).await {
-                        Err(e) => {
-                            warn!("per-client task finished with an error: {e:#}");
+                    match tokio::time::timeout_at(
+                        permit.started
+                            + config.handshake_timeout.min(config.authentication_timeout),
+                        read_proxy_protocol(socket),
+                    )
+                    .await
+                    {
+                        Err(_) => {
+                            Metrics::get().proxy.preauth_timeout_total.inc();
                             return;
                         }
-                        // our load balancers will not send any more data. let's just exit immediately
-                        Ok((_socket, ConnectHeader::Local)) => {
-                            debug!("healthcheck received");
-                            return;
-                        }
-                        Ok((socket, ConnectHeader::Proxy(info))) => (socket, info),
+                        Ok(result) => match result {
+                            Err(e) => {
+                                warn!("per-client task finished with an error: {e:#}");
+                                return;
+                            }
+                            // our load balancers will not send any more data. let's just exit immediately
+                            Ok((_socket, ConnectHeader::Local)) => {
+                                debug!("healthcheck received");
+                                return;
+                            }
+                            Ok((socket, ConnectHeader::Proxy(info))) => (socket, info),
+                        },
                     }
                 }
                 // ignore the header - it cannot be confused for a postgres or http connection so will
@@ -118,6 +136,10 @@ pub async fn task_main(
                 ),
             };
 
+            if !permit.assign_source(conn_info.addr.ip()) {
+                Metrics::get().proxy.preauth_source_rejected_total.inc();
+                return;
+            }
             match socket.set_nodelay(true) {
                 Ok(()) => {}
                 Err(e) => {
@@ -143,6 +165,7 @@ pub async fn task_main(
                 lakeon_data_proxy,
                 Some(lakeon_backend_pool.clone()),
                 lakeon_pooler_queue_timeout,
+                permit,
             )
             .instrument(ctx.span())
             .boxed()
@@ -279,6 +302,7 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     lakeon_data_proxy: bool,
     lakeon_backend_pool: Option<Arc<LakeonBackendPool>>,
     lakeon_pooler_queue_timeout: Duration,
+    preauth_permit: crate::admission::Permit,
 ) -> Result<Option<ProxyConnection<S>>, ClientRequestError> {
     debug!(
         protocol = %ctx.protocol(),
@@ -296,7 +320,10 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let pause = ctx.latency_timer_pause(crate::metrics::Waiting::Client);
     let do_handshake = handshake(ctx, client, mode.handshake_tls(tls), record_handshake_error);
 
-    let (mut client, params) = match tokio::time::timeout(config.handshake_timeout, do_handshake)
+    let authentication_deadline = preauth_permit.started + config.authentication_timeout;
+    let handshake_deadline =
+        authentication_deadline.min(tokio::time::Instant::now() + config.handshake_timeout);
+    let (mut client, params) = match tokio::time::timeout_at(handshake_deadline, do_handshake)
         .await??
     {
         HandshakeData::Startup(client, params) => (client, params),
@@ -330,17 +357,22 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
     let common_names = tls.map(|tls| &tls.common_names);
 
-    let mut authenticated = authenticate_client(
-        config,
-        auth_backend,
-        ctx,
-        &mut client,
-        &mode,
-        endpoint_rate_limiter,
-        common_names,
-        &params,
+    let mut authenticated = tokio::time::timeout_at(
+        authentication_deadline,
+        authenticate_client(
+            config,
+            auth_backend,
+            ctx,
+            &mut client,
+            &mode,
+            endpoint_rate_limiter,
+            common_names,
+            &params,
+        ),
     )
-    .await?;
+    .await??;
+    // Authenticated sessions no longer consume the pre-authentication budget.
+    drop(preauth_permit);
 
     if let Err(error) = authenticated.resolve_read_only(ctx).await {
         return Err(client.throw_error(error, Some(ctx)).await.into());

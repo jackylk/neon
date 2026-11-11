@@ -138,6 +138,18 @@ struct ProxyCliArgs {
     /// path to directory with TLS certificates for client postgres connections
     #[clap(long)]
     certs_dir: Option<PathBuf>,
+    /// Refuse startup unless the PostgreSQL TLS certificate is configured.
+    #[clap(long)]
+    require_tls: bool,
+    /// Per-process maximum clients still completing PostgreSQL authentication.
+    #[clap(long, default_value = "1024")]
+    max_unauthenticated_connections: std::num::NonZeroUsize,
+    /// Per-process maximum unauthenticated clients for one source IP.
+    #[clap(long, default_value = "64")]
+    max_unauthenticated_connections_per_ip: std::num::NonZeroUsize,
+    /// Absolute deadline from admission through PostgreSQL authentication.
+    #[clap(long, default_value = "30s", value_parser = humantime::parse_duration)]
+    authentication_timeout: tokio::time::Duration,
     /// timeout for the TLS handshake
     #[clap(long, default_value = "15s", value_parser = humantime::parse_duration)]
     handshake_timeout: tokio::time::Duration,
@@ -656,6 +668,18 @@ fn build_config(args: &ProxyCliArgs) -> anyhow::Result<&'static ProxyConfig> {
         (None, None) => None,
         _ => bail!("either both or neither tls-key and tls-cert must be specified"),
     };
+    anyhow::ensure!(
+        !args.require_tls || tls_config.is_some(),
+        "--require-tls requires a TLS key and certificate"
+    );
+    anyhow::ensure!(
+        !args.authentication_timeout.is_zero(),
+        "authentication timeout must be positive"
+    );
+    anyhow::ensure!(
+        !args.handshake_timeout.is_zero(),
+        "handshake timeout must be positive"
+    );
     let tls_config = ArcSwapOption::from(tls_config.map(Arc::new));
 
     let backup_metric_collection_config = config::MetricBackupCollectionConfig {
@@ -780,6 +804,11 @@ fn build_config(args: &ProxyCliArgs) -> anyhow::Result<&'static ProxyConfig> {
         authentication_config,
         proxy_protocol_v2: args.proxy_protocol_v2,
         handshake_timeout: args.handshake_timeout,
+        authentication_timeout: args.authentication_timeout,
+        admission: crate::admission::Admission::new(
+            args.max_unauthenticated_connections.get(),
+            args.max_unauthenticated_connections_per_ip.get(),
+        ),
         wake_compute_retry_config: config::RetryConfig::parse(&args.wake_compute_retry)?,
         connect_compute_locks,
         connect_to_compute: compute_config,
@@ -1003,6 +1032,32 @@ mod tests {
     use clap::Parser;
 
     use crate::rate_limiter::RateBucketInfo;
+
+    #[test]
+    fn public_security_cli_limits() {
+        let config = super::ProxyCliArgs::parse_from([
+            "proxy",
+            "--require-tls",
+            "--max-unauthenticated-connections=12",
+            "--max-unauthenticated-connections-per-ip=3",
+            "--authentication-timeout=2s",
+        ]);
+        assert!(config.require_tls);
+        assert_eq!(config.max_unauthenticated_connections.get(), 12);
+        assert_eq!(config.max_unauthenticated_connections_per_ip.get(), 3);
+        assert_eq!(config.authentication_timeout, Duration::from_secs(2));
+        assert!(
+            super::ProxyCliArgs::try_parse_from(["proxy", "--max-unauthenticated-connections=0"])
+                .is_err()
+        );
+        assert!(
+            super::ProxyCliArgs::try_parse_from([
+                "proxy",
+                "--max-unauthenticated-connections-per-ip=0"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn parse_endpoint_rps_limit() {
