@@ -66,6 +66,7 @@ pub(crate) async fn proxy_pass(
 
 pub(crate) struct ProxyPassthrough<S> {
     pub(crate) client: Stream<S>,
+    pub(crate) client_write_timeout: Option<std::time::Duration>,
     pub(crate) compute: MaybeRustlsStream,
 
     pub(crate) aux: MetricsAuxInfo,
@@ -80,6 +81,11 @@ pub(crate) struct ProxyPassthrough<S> {
 
 impl<S: AsyncRead + AsyncWrite + Unpin> ProxyPassthrough<S> {
     pub(crate) async fn proxy_pass(self) -> Result<(), ErrorSource> {
-        proxy_pass(self.client, self.compute, self.aux, self.private_link_id).await
+        proxy_pass(
+            crate::client_write_guard::ClientWriteGuard::new(self.client, self.client_write_timeout),
+            self.compute,
+            self.aux,
+            self.private_link_id,
+        ).await
     }
 }

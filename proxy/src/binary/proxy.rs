@@ -159,6 +159,9 @@ struct ProxyCliArgs {
     /// Absolute deadline from admission through PostgreSQL authentication.
     #[clap(long, default_value = "30s", value_parser = humantime::parse_duration)]
     authentication_timeout: tokio::time::Duration,
+    /// Maximum continuous client output stall (defaults to 30s with shared security).
+    #[clap(long, value_parser = humantime::parse_duration)]
+    client_write_timeout: Option<tokio::time::Duration>,
     /// timeout for the TLS handshake
     #[clap(long, default_value = "15s", value_parser = humantime::parse_duration)]
     handshake_timeout: tokio::time::Duration,
@@ -840,6 +843,10 @@ fn build_config(args: &ProxyCliArgs) -> anyhow::Result<&'static ProxyConfig> {
     } else {
         None
     };
+    anyhow::ensure!(
+        args.client_write_timeout.is_none_or(|v| !v.is_zero()),
+        "client-write-timeout must be positive"
+    );
     let config = ProxyConfig {
         tls_config,
         shared_security,
@@ -849,6 +856,9 @@ fn build_config(args: &ProxyCliArgs) -> anyhow::Result<&'static ProxyConfig> {
         proxy_protocol_v2: args.proxy_protocol_v2,
         handshake_timeout: args.handshake_timeout,
         authentication_timeout: args.authentication_timeout,
+        client_write_timeout: args.client_write_timeout.or_else(|| {
+            args.shared_security_enabled.then_some(Duration::from_secs(30))
+        }),
         admission: crate::admission::Admission::new(
             args.max_unauthenticated_connections.get(),
             args.max_unauthenticated_connections_per_ip.get(),

@@ -21,6 +21,7 @@ const MAX_POOLED_MESSAGE_BYTES: u32 = 16 * 1024 * 1024;
 
 pub(crate) struct LakeonPooledSession<S> {
     pub(crate) client: Stream<S>,
+    pub(crate) client_write_timeout: Option<std::time::Duration>,
     pub(crate) backend: Option<PooledBackend>,
     pub(crate) pool: Arc<LakeonBackendPool>,
     pub(crate) pool_key: PoolKey,
@@ -45,7 +46,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> LakeonPooledSession<S> {
         );
         let mut checkout_guard = self.checkout_guard.take();
         let mut backend = self.backend.take().expect("pooled backend is present");
-        let result = proxy_transaction_aware(self.client, &mut backend.compute).await;
+        let result = proxy_transaction_aware(
+            crate::client_write_guard::ClientWriteGuard::new(self.client, self.client_write_timeout),
+            &mut backend.compute,
+        ).await;
         if matches!(result, Ok(BackendTransactionStatus::Idle))
             && reset_backend(&mut backend.compute).await.is_ok()
         {

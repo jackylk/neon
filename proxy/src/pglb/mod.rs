@@ -488,6 +488,7 @@ async fn finish_authenticated_connection<S: AsyncRead + AsyncWrite + Unpin + Sen
                 let client = client.flush_and_into_inner().await?;
                 return Ok(Some(ProxyConnectionKind::LakeonPooled(
                     LakeonPooledSession {
+                        client_write_timeout: config.client_write_timeout,
                         client,
                         aux: backend.aux.clone(),
                         backend: Some(backend),
@@ -586,6 +587,7 @@ async fn finish_authenticated_connection<S: AsyncRead + AsyncWrite + Unpin + Sen
         let aux = node.aux.clone();
         Ok(Some(ProxyConnectionKind::LakeonPooled(
             LakeonPooledSession {
+                client_write_timeout: config.client_write_timeout,
                 client,
                 checkout_guard: checkout_guard.take(),
                 backend: Some(PooledBackend {
@@ -616,6 +618,7 @@ async fn finish_authenticated_connection<S: AsyncRead + AsyncWrite + Unpin + Sen
             }
         }
         Ok(Some(ProxyConnectionKind::Direct(ProxyPassthrough {
+            client_write_timeout: config.client_write_timeout,
             client,
             compute: node.stream.into_framed().into_inner(),
 

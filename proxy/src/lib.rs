@@ -78,6 +78,7 @@
 
 pub mod binary;
 
+mod client_write_guard;
 mod admission;
 mod security;
 mod auth;

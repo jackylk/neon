@@ -262,6 +262,7 @@ pub(crate) async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send>(
     });
 
     Ok(Some(ProxyPassthrough {
+        client_write_timeout: config.client_write_timeout,
         client: stream,
         compute: node.stream.into_framed().into_inner(),
 

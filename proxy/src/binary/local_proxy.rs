@@ -277,6 +277,7 @@ fn build_config(args: &LocalProxyCliArgs) -> anyhow::Result<&'static ProxyConfig
     });
 
     Ok(Box::leak(Box::new(ProxyConfig {
+        client_write_timeout: None,
         tls_config: ArcSwapOption::from(None),
         metric_collection: None,
         http_config,
