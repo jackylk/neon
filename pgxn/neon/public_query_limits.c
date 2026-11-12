@@ -12,6 +12,7 @@
 
 static bool enabled = false;
 static bool initialized = false;
+static bool hooks_ready = false;
 
 enum LimitId { STATEMENT, LOCK_WAIT, IDLE_TRANSACTION, WORK_MEM, MAINTENANCE_MEM, PARALLEL_WORKERS, N_LIMITS };
 static const char *names[N_LIMITS] = {
@@ -20,6 +21,8 @@ static const char *names[N_LIMITS] = {
 };
 static int maxima[N_LIMITS] = {60000, 5000, 60000, 16384, 65536, 2};
 static GucIntCheckHook previous[N_LIMITS];
+static int *current_values[N_LIMITS];
+static double *current_hash_multiplier;
 static GucRealCheckHook previous_hash_multiplier;
 static double max_hash_multiplier = 2.0;
 
@@ -43,6 +46,32 @@ reject_stored_setting(GucSource source, const char *name)
     if (source == PGC_S_DATABASE || source == PGC_S_USER || source == PGC_S_DATABASE_USER)
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                        errmsg("public query budget rejects stored setting for %s", name)));
+}
+
+static bool
+check_enabled(bool *value, void **extra, GucSource source)
+{
+    int i;
+
+    if (!*value || !hooks_ready || (IsUnderPostmaster && !AmRegularBackendProcess()))
+        return true;
+    for (i = 0; i < N_LIMITS; i++)
+    {
+        if ((*current_values[i] <= 0 && i != PARALLEL_WORKERS) || *current_values[i] > maxima[i])
+        {
+            reject_stored_setting(source, names[i]);
+            GUC_check_errdetail("Cannot enable public query guard with unsafe current setting: %s.", names[i]);
+            return false;
+        }
+    }
+    if (!isfinite(max_hash_multiplier) || !isfinite(*current_hash_multiplier)
+        || *current_hash_multiplier < 1.0 || *current_hash_multiplier > max_hash_multiplier)
+    {
+        reject_stored_setting(source, "hash_mem_multiplier");
+        GUC_check_errdetail("Cannot enable public query guard with unsafe hash memory setting.");
+        return false;
+    }
+    return true;
 }
 
 static bool
@@ -106,7 +135,7 @@ neon_public_query_limits_init(void)
     initialized = true;
     DefineCustomBoolVariable("neon.public_query_limits",
         "Enforce public query resource ceilings.", NULL, &enabled, false,
-        PGC_SUSET, 0, NULL, NULL, NULL);
+        PGC_SUSET, 0, check_enabled, NULL, NULL);
     for (i = 0; i < N_LIMITS; i++)
         DefineCustomIntVariable(cap_names[i], "Maximum public query resource setting.",
             NULL, &maxima[i], maxima[i], i == PARALLEL_WORKERS ? 0 : 1,
@@ -133,6 +162,7 @@ neon_public_query_limits_init(void)
                 if (guc->vartype != PGC_INT)
                     elog(FATAL, "unexpected GUC type for public query budget");
                 setting = (struct config_int *) guc;
+                current_values[j] = setting->variable;
                 previous[j] = setting->check_hook;
                 setting->check_hook = hooks[j];
                 found[j] = true;
@@ -144,6 +174,7 @@ neon_public_query_limits_init(void)
         if (strcmp(guc->name, "hash_mem_multiplier") == 0)
         {
             struct config_real *setting = (struct config_real *) guc;
+            current_hash_multiplier = setting->variable;
             previous_hash_multiplier = setting->check_hook;
             setting->check_hook = check_hash_multiplier;
             found_hash = true;
@@ -157,4 +188,5 @@ neon_public_query_limits_init(void)
             elog(FATAL, "required public query resource parameter is missing");
     if (!found_hash)
         elog(FATAL, "required public hash memory parameter is missing");
+    hooks_ready = true;
 }
