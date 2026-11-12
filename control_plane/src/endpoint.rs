@@ -780,6 +780,7 @@ impl Endpoint {
                     state: None,
                     roles: if args.create_test_user {
                         vec![Role {
+                            lakeon_public_access: None,
                             name: PgIdent::from_str("test").unwrap(),
                             encrypted_password: None,
                             options: None,
@@ -839,6 +840,7 @@ impl Endpoint {
                 // fill missing fields again
                 if args.create_test_user {
                     spec.cluster.roles.push(Role {
+                        lakeon_public_access: None,
                         name: PgIdent::from_str("test").unwrap(),
                         encrypted_password: None,
                         options: None,

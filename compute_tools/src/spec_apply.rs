@@ -792,6 +792,12 @@ async fn get_operations<'a>(
                     let roles = &mut ctx.roles;
                     let db_role = roles.get(&role.name);
 
+                    if role.lakeon_public_access.is_some() {
+                        return Some(Operation {
+                            query: crate::public_roles::provision(role.name.as_str(), &role.to_pg_options(), db_role.is_some()),
+                            comment: Some(format!("applying restricted customer role {}",role.name)),
+                        });
+                    }
                     match db_role {
                         Some(db_role) => {
                             if db_role.encrypted_password != role.encrypted_password {
@@ -1115,7 +1121,7 @@ async fn get_operations<'a>(
                     };
                     let (db_owner, outer_tag) = db.owner.pg_quote_dollar();
 
-                    let operations = vec![
+                    let mut operations = vec![
                         Operation {
                             query: format!(
                                 include_str!("sql/set_public_schema_owner.sql"),
@@ -1129,10 +1135,18 @@ async fn get_operations<'a>(
                                 .replace("neon_superuser", &params.privileged_role_name),
                             comment: None,
                         },
-                    ]
-                    .into_iter();
-
-                    Ok(Box::new(operations))
+                    ];
+                    for role in &spec.cluster.roles {
+                        if let Some(access)=&role.lakeon_public_access {
+                            if access.enabled {
+                                operations.push(Operation {
+                                    query: crate::public_roles::grants(db.name.as_str(),db.owner.as_str(),role.name.as_str(),&access.level),
+                                    comment: Some(format!("applying customer grants for {}",role.name)),
+                                });
+                            }
+                        }
+                    }
+                    Ok(Box::new(operations.into_iter()))
                 }
             }
         }

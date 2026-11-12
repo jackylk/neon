@@ -31,6 +31,7 @@ pub mod pgbouncer;
 pub mod rsyslog;
 pub mod spec;
 mod spec_apply;
+pub mod public_roles;
 pub mod swap;
 pub mod sync_sk;
 pub mod tls;

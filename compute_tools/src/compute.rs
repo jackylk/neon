@@ -450,6 +450,7 @@ pub(crate) fn create_databricks_roles() -> Vec<String> {
     let roles = vec![
         // Role for prometheus_stats_exporter
         Role {
+            lakeon_public_access: None,
             name: "databricks_monitor".to_string(),
             // This uses "local" connection and auth method for that is "trust", so no password is needed.
             encrypted_password: None,
@@ -461,6 +462,7 @@ pub(crate) fn create_databricks_roles() -> Vec<String> {
         },
         // Role for brickstore control plane
         Role {
+            lakeon_public_access: None,
             name: "databricks_control_plane".to_string(),
             // Certificate user does not need password.
             encrypted_password: None,
@@ -472,6 +474,7 @@ pub(crate) fn create_databricks_roles() -> Vec<String> {
         },
         // Role for brickstore httpgateway.
         Role {
+            lakeon_public_access: None,
             name: "databricks_gateway".to_string(),
             // Certificate user does not need password.
             encrypted_password: None,

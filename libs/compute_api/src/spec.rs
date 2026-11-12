@@ -566,9 +566,22 @@ pub struct DeltaOp {
 /// that matter for us.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Role {
+    /// Explicit Lakeon customer policy; absent retains upstream compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lakeon_public_access: Option<LakeonPublicAccess>,
     pub name: PgIdent,
     pub encrypted_password: Option<String>,
     pub options: GenericOptions,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum LakeonPublicLevel { Reader, Writer, Admin }
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LakeonPublicAccess {
+    pub level: LakeonPublicLevel,
+    pub enabled: bool,
 }
 
 /// Rust representation of Postgres database info with only those fields

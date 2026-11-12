@@ -146,7 +146,7 @@ impl RoleExt for Role {
     fn to_pg_options(&self) -> String {
         // XXX: consider putting LOGIN as a default option somewhere higher, e.g. in control-plane.
         let mut params: String = self.options.as_pg_options();
-        params.push_str(" LOGIN");
+        params.push_str(if self.lakeon_public_access.as_ref().is_some_and(|p| !p.enabled) { " NOLOGIN" } else { " LOGIN" });
 
         if let Some(pass) = &self.encrypted_password {
             // Some time ago we supported only md5 and treated all encrypted_password as md5.
@@ -275,6 +275,7 @@ pub async fn get_existing_roles_async(client: &tokio_postgres::Client) -> Result
         .await?
         .filter_map(|row| async { row.ok() })
         .map(|row| Role {
+            lakeon_public_access: None,
             name: row.get("rolname"),
             encrypted_password: row.get("rolpassword"),
             options: None,
