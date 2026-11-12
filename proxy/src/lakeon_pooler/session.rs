@@ -31,6 +31,7 @@ pub(crate) struct LakeonPooledSession<S> {
     pub(crate) _cancel_on_shutdown: tokio::sync::oneshot::Sender<Infallible>,
 
     pub(crate) _req: NumConnectionRequestsGuard<'static>,
+    pub(crate) checkout_guard: Option<super::pool::CheckoutGuard>,
     pub(crate) _conn: NumClientConnectionsGuard<'static>,
 }
 
@@ -42,6 +43,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> LakeonPooledSession<S> {
             private_link_id = ?self.private_link_id,
             "performing Lakeon transaction-aware pooled proxy pass"
         );
+        let mut checkout_guard = self.checkout_guard.take();
         let mut backend = self.backend.take().expect("pooled backend is present");
         let result = proxy_transaction_aware(self.client, &mut backend.compute).await;
         if matches!(result, Ok(BackendTransactionStatus::Idle))
@@ -50,6 +52,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> LakeonPooledSession<S> {
             self.pool.release_idle(self.pool_key, backend).await;
         } else {
             self.pool.release_checked_out(&self.pool_key).await;
+        }
+        if let Some(guard) = checkout_guard.as_mut() {
+            guard.disarm();
         }
         result.map(|_| ())
     }

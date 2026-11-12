@@ -102,6 +102,16 @@ pub struct ProxyMetrics {
     pub preauth_source_rejected_total: Counter,
     /// Connections that exhausted the transport header deadline.
     pub preauth_timeout_total: Counter,
+    /// Shared Redis budget operations rejected (including bounded queue retries).
+    pub shared_security_rejections_total: Counter,
+    /// Shared Redis transport or response failures.
+    pub shared_security_dependency_errors_total: Counter,
+    /// Connections entering the bounded shared waiting queue.
+    pub shared_security_queue_entries_total: Counter,
+    /// Connections whose bounded shared queue wait expired.
+    pub shared_security_queue_timeouts_total: Counter,
+    /// Session watchdogs revoked due to expiry or loss of ownership.
+    pub shared_security_lease_expired_total: Counter,
 
     /// Number of Lakeon pooled TCP connections rejected after waiting for a backend too long.
     pub lakeon_pooler_queue_timeout_total: Counter,

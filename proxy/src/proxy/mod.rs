@@ -54,6 +54,13 @@ impl AuthenticatedClient<'_> {
         Ok(())
     }
 
+    pub(crate) fn security_endpoint(&self) -> &str {
+        match &self.backend {
+            auth::Backend::ControlPlane(_, info) => info.endpoint.as_str(),
+            auth::Backend::Local(_) => "",
+        }
+    }
+
     pub(crate) fn is_lakeon_pooler_endpoint(&self) -> bool {
         match &self.backend {
             auth::Backend::ControlPlane(_, user_info) => {
@@ -159,6 +166,24 @@ pub(crate) async fn authenticate_client<'a, S: AsyncRead + AsyncWrite + Unpin + 
     };
 
     let user = user_info.get_user().to_owned();
+    if let Some(shared) = &config.shared_security {
+        if let Err(error) = shared
+            .pre_auth(
+                ctx.peer_addr(),
+                &user,
+                match &user_info {
+                    auth::Backend::ControlPlane(_, info) => {
+                        info.endpoint().unwrap_or("unspecified")
+                    }
+                    auth::Backend::Local(_) => "local",
+                },
+            )
+            .await
+        {
+            return Err(client.throw_error(error, Some(ctx)).await.into());
+        }
+    }
+
     let user_info = match user_info
         .authenticate(
             ctx,

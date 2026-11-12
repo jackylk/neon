@@ -22,6 +22,35 @@ pub(crate) struct LakeonBackendPool {
     max_backends_per_key: usize,
 }
 
+/// Ensures cancellation of a quota-governed future cannot leak a pool reservation.
+pub(crate) struct CheckoutGuard {
+    pool: LakeonBackendPool,
+    key: Option<PoolKey>,
+}
+impl CheckoutGuard {
+    pub(crate) fn new(pool: LakeonBackendPool, key: PoolKey) -> Self {
+        Self {
+            pool,
+            key: Some(key),
+        }
+    }
+    pub(crate) fn disarm(&mut self) {
+        self.key = None;
+    }
+}
+impl Drop for CheckoutGuard {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            let pool = self.pool.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    pool.release_checked_out(&key).await;
+                });
+            }
+        }
+    }
+}
+
 impl LakeonBackendPool {
     pub(crate) fn new(max_backends_per_key: usize) -> Self {
         Self {
@@ -455,5 +484,39 @@ mod tests {
             key.clone().with_startup_params(&a),
             key.with_startup_params(&b)
         );
+    }
+}
+
+#[cfg(test)]
+mod cancellation_safety_tests {
+    use super::*;
+    #[tokio::test]
+    async fn cancelled_checkout_returns_capacity() {
+        let pool = LakeonBackendPool::new(1);
+        let key = PoolKey::new("ep", "br", "db", "role");
+        assert!(matches!(
+            pool.checkout_or_reserve(&key, Duration::ZERO)
+                .await
+                .unwrap(),
+            Checkout::ReservedNew
+        ));
+        let guard = CheckoutGuard::new(pool.clone(), key.clone());
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if pool.stats().await.total == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            pool.checkout_or_reserve(&key, Duration::ZERO)
+                .await
+                .unwrap(),
+            Checkout::ReservedNew
+        ));
     }
 }

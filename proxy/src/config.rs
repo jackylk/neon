@@ -37,6 +37,7 @@ pub struct ProxyConfig {
     pub proxy_protocol_v2: ProxyProtocolV2,
     pub handshake_timeout: Duration,
     pub authentication_timeout: Duration,
+    pub(crate) shared_security: Option<Arc<crate::security::SharedSecurity>>,
     pub(crate) admission: crate::admission::Admission,
     pub wake_compute_retry_config: RetryConfig,
     pub connect_compute_locks: ApiLocks<Host>,

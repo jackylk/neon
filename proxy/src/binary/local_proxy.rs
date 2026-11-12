@@ -300,6 +300,7 @@ fn build_config(args: &LocalProxyCliArgs) -> anyhow::Result<&'static ProxyConfig
         proxy_protocol_v2: config::ProxyProtocolV2::Rejected,
         handshake_timeout: Duration::from_secs(10),
         authentication_timeout: Duration::from_secs(30),
+        shared_security: None,
         admission: crate::admission::Admission::new(1024, 64),
         wake_compute_retry_config: RetryConfig::parse(RetryConfig::WAKE_COMPUTE_DEFAULT_VALUES)?,
         connect_compute_locks,

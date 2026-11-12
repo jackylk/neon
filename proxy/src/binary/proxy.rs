@@ -138,6 +138,15 @@ struct ProxyCliArgs {
     /// path to directory with TLS certificates for client postgres connections
     #[clap(long)]
     certs_dir: Option<PathBuf>,
+    /// Enable cross-proxy authentication budgets and canonical tenant/database leases.
+    #[clap(long, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set)]
+    shared_security_enabled: bool,
+    #[clap(long, default_value_t = 30000)]
+    shared_security_lease_ms: u64,
+    #[clap(long, default_value_t = 10)]
+    shared_auth_rate: u32,
+    #[clap(long, default_value_t = 20)]
+    shared_auth_burst: u32,
     /// Refuse startup unless the PostgreSQL TLS certificate is configured.
     #[clap(long)]
     require_tls: bool,
@@ -387,7 +396,7 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     let config = build_config(&args)?;
-    let auth_backend = build_auth_backend(&args)?;
+    let auth_backend = build_auth_backend(&args, config.shared_security.clone())?;
 
     match auth_backend {
         Either::Left(auth_backend) => info!("Authentication backend: {auth_backend}"),
@@ -395,6 +404,9 @@ pub async fn run() -> anyhow::Result<()> {
     }
     info!("Using region: {}", args.aws_region);
     let redis_client = configure_redis(&args).await?;
+    if let Some(shared) = &config.shared_security {
+        shared.prepare().await?;
+    }
 
     // Check that we can bind to address before further initialization
     info!("Starting http on {}", args.http);
@@ -797,8 +809,40 @@ fn build_config(args: &ProxyCliArgs) -> anyhow::Result<&'static ProxyConfig> {
         }
     }
 
+    let shared_security = if args.shared_security_enabled {
+        ensure!(args.require_tls, "shared security requires --require-tls");
+        ensure!(
+            matches!(args.auth_backend, AuthBackendType::ControlPlane)
+                && !args.is_auth_broker
+                && args.pg_sni_router.dest.is_none(),
+            "shared security requires the direct control-plane PG/WS backend"
+        );
+        ensure!(
+            args.shared_auth_rate <= 10000 && args.shared_auth_burst <= 10000,
+            "shared auth budgets must not exceed 10000"
+        );
+        ensure!(
+            args.redis_auth_type == "plain",
+            "shared security requires the configured shared Redis URL"
+        );
+        let url = args
+            .redis_plain
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("shared security requires Redis"))?;
+        Some(crate::security::SharedSecurity::new(
+            url,
+            http::Endpoint::new(args.auth_endpoint.parse()?, http::new_client()),
+            args.control_plane_token.clone(),
+            args.shared_security_lease_ms,
+            args.shared_auth_rate,
+            args.shared_auth_burst,
+        )?)
+    } else {
+        None
+    };
     let config = ProxyConfig {
         tls_config,
+        shared_security,
         metric_collection,
         http_config,
         authentication_config,
@@ -829,6 +873,7 @@ fn build_config(args: &ProxyCliArgs) -> anyhow::Result<&'static ProxyConfig> {
 /// auth::Backend is created at proxy startup, and lives forever.
 fn build_auth_backend(
     args: &ProxyCliArgs,
+    shared_security: Option<Arc<crate::security::SharedSecurity>>,
 ) -> anyhow::Result<Either<&'static auth::Backend<'static, ()>, &'static ConsoleRedirectBackend>> {
     match &args.auth_backend {
         AuthBackendType::ControlPlane => {
@@ -878,7 +923,8 @@ fn build_auth_backend(
                 caches,
                 locks,
                 wake_compute_endpoint_rate_limiter,
-            );
+            )
+            .with_shared_security(shared_security.clone());
 
             let api = control_plane::client::ControlPlaneClient::ProxyV1(api);
             let auth_backend = auth::Backend::ControlPlane(MaybeOwned::Owned(api), ());
@@ -957,7 +1003,8 @@ fn build_auth_backend(
                 caches,
                 locks,
                 wake_compute_endpoint_rate_limiter,
-            );
+            )
+            .with_shared_security(shared_security.clone());
 
             let backend = ConsoleRedirectBackend::new(url, api);
             let config = Box::leak(Box::new(backend));

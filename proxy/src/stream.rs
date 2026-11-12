@@ -43,6 +43,19 @@ impl<S> PqStream<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> PqStream<S> {
+    /// Used only while waiting for admission, before ReadyForQuery. Any input
+    /// ends the wait: EOF disconnects, and premature protocol input is rejected.
+    pub(crate) async fn wait_for_admission_disconnect(&mut self) -> io::Result<()> {
+        use tokio::io::AsyncReadExt;
+        let mut byte = [0u8; 1];
+        match self.stream.read(&mut byte).await? {
+            0 => Ok(()),
+            _ => Err(io::Error::other(
+                "client sent data before admission completed",
+            )),
+        }
+    }
+
     /// Construct a new libpq protocol wrapper and read the first startup message.
     ///
     /// This is not cancel safe.

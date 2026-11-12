@@ -415,6 +415,16 @@ async fn request_handler(
         .and_then(|h| h.split(':').next())
         .map(|s| s.to_string());
 
+    // SQL-over-HTTP does not share PG session lifetime accounting. Fail closed
+    // while shared PG security is enabled rather than offering a quota bypass.
+    if config.shared_security.is_some() && !framed_websockets::upgrade::is_upgrade_request(&request)
+    {
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Empty::new().map_err(|x| match x {}).boxed())
+            .map_err(|e| ApiError::InternalServerError(e.into()));
+    }
+
     // Check if the request is a websocket upgrade request.
     if config.http_config.accept_websockets
         && framed_websockets::upgrade::is_upgrade_request(&request)

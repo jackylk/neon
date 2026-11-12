@@ -243,16 +243,31 @@ impl ClientMode {
     }
 }
 
-pub(crate) enum ProxyConnection<S> {
+pub(crate) struct ProxyConnection<S> {
+    inner: ProxyConnectionKind<S>,
+    lease: Option<crate::security::SessionLease>,
+}
+pub(crate) enum ProxyConnectionKind<S> {
     Direct(ProxyPassthrough<S>),
     LakeonPooled(LakeonPooledSession<S>),
 }
-
-impl<S: AsyncRead + AsyncWrite + Unpin> ProxyConnection<S> {
-    pub(crate) async fn proxy_pass(self) -> Result<(), ErrorSource> {
+impl<S: AsyncRead + AsyncWrite + Unpin> ProxyConnectionKind<S> {
+    async fn proxy_pass(self) -> Result<(), ErrorSource> {
         match self {
             Self::Direct(p) => p.proxy_pass().await,
             Self::LakeonPooled(p) => p.proxy_pass().await,
+        }
+    }
+}
+impl<S: AsyncRead + AsyncWrite + Unpin> ProxyConnection<S> {
+    pub(crate) async fn proxy_pass(mut self) -> Result<(), ErrorSource> {
+        let future = self.inner.proxy_pass();
+        if let Some(lease) = self.lease.as_mut() {
+            lease.protect(future).await.map_err(|_| {
+                ErrorSource::Client(std::io::Error::other("shared connection lease expired"))
+            })?
+        } else {
+            future.await
         }
     }
 }
@@ -267,6 +282,8 @@ pub(crate) enum ClientRequestError {
     #[error("{0}")]
     Cancellation(#[from] cancellation::CancelError),
     #[error("{0}")]
+    Security(#[from] crate::security::SecurityError),
+    #[error("{0}")]
     Handshake(#[from] HandshakeError),
     #[error("{0}")]
     HandshakeTimeout(#[from] tokio::time::error::Elapsed),
@@ -280,6 +297,7 @@ impl ReportableError for ClientRequestError {
     fn get_error_kind(&self) -> crate::error::ErrorKind {
         match self {
             ClientRequestError::Cancellation(e) => e.get_error_kind(),
+            ClientRequestError::Security(e) => e.get_error_kind(),
             ClientRequestError::Handshake(e) => e.get_error_kind(),
             ClientRequestError::HandshakeTimeout(_) => crate::error::ErrorKind::RateLimit,
             ClientRequestError::ReportedError(e) => e.get_error_kind(),
@@ -357,7 +375,7 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
     let common_names = tls.map(|tls| &tls.common_names);
 
-    let mut authenticated = tokio::time::timeout_at(
+    let authenticated = tokio::time::timeout_at(
         authentication_deadline,
         authenticate_client(
             config,
@@ -374,6 +392,57 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     // Authenticated sessions no longer consume the pre-authentication budget.
     drop(preauth_permit);
 
+    let mut lease = if let Some(shared) = &config.shared_security {
+        let context = match shared.context(authenticated.security_endpoint()).await {
+            Ok(context) => context,
+            Err(error) => return Err(client.throw_error(error, Some(ctx)).await.into()),
+        };
+        let admission = tokio::select! { biased;
+            _=client.wait_for_admission_disconnect()=>return Ok(None),
+            result=shared.admit(&context)=>result,
+        };
+        match admission {
+            Ok(lease) => Some(lease),
+            Err(error) => return Err(client.throw_error(error, Some(ctx)).await.into()),
+        }
+    } else {
+        None
+    };
+    let finish = finish_authenticated_connection(
+        config,
+        ctx,
+        cancellation_handler,
+        client,
+        params,
+        authenticated,
+        conn_gauge,
+        request_gauge,
+        lakeon_data_proxy,
+        lakeon_backend_pool,
+        lakeon_pooler_queue_timeout,
+    );
+    let inner = if let Some(guard) = lease.as_mut() {
+        guard.protect(finish).await??
+    } else {
+        finish.await?
+    };
+    Ok(inner.map(|inner| ProxyConnection { inner, lease }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_authenticated_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    config: &'static ProxyConfig,
+    ctx: &RequestContext,
+    cancellation_handler: Arc<CancellationHandler>,
+    mut client: crate::stream::PqStream<Stream<S>>,
+    params: crate::pqproto::StartupMessageParams,
+    mut authenticated: crate::proxy::AuthenticatedClient<'_>,
+    conn_gauge: NumClientConnectionsGuard<'static>,
+    request_gauge: crate::metrics::NumConnectionRequestsGuard<'static>,
+    lakeon_data_proxy: bool,
+    lakeon_backend_pool: Option<Arc<LakeonBackendPool>>,
+    lakeon_pooler_queue_timeout: Duration,
+) -> Result<Option<ProxyConnectionKind<S>>, ClientRequestError> {
     if let Err(error) = authenticated.resolve_read_only(ctx).await {
         return Err(client.throw_error(error, Some(ctx)).await.into());
     }
@@ -393,6 +462,7 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
         None => None,
     };
 
+    let mut checkout_guard: Option<crate::lakeon_pooler::pool::CheckoutGuard> = None;
     let lakeon_new_backend_reserved = if let (Some(pool_key), Some(pool)) =
         (&lakeon_pool_key, &lakeon_backend_pool)
     {
@@ -401,6 +471,10 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
             .await
         {
             Ok(Checkout::Idle(backend)) => {
+                let checkout_guard = Some(crate::lakeon_pooler::pool::CheckoutGuard::new(
+                    pool.as_ref().clone(),
+                    pool_key.clone(),
+                ));
                 send_client_greeting(ctx, &config.greetings, &mut client);
                 let (cancel_key_data, cancel_on_shutdown) = register_backend_cancel_key(
                     config,
@@ -412,19 +486,28 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     .startup_replay
                     .write_to(&mut client, cancel_key_data);
                 let client = client.flush_and_into_inner().await?;
-                return Ok(Some(ProxyConnection::LakeonPooled(LakeonPooledSession {
-                    client,
-                    aux: backend.aux.clone(),
-                    backend: Some(backend),
-                    pool: pool.clone(),
-                    pool_key: pool_key.clone(),
-                    private_link_id,
-                    _cancel_on_shutdown: cancel_on_shutdown,
-                    _req: request_gauge,
-                    _conn: conn_gauge,
-                })));
+                return Ok(Some(ProxyConnectionKind::LakeonPooled(
+                    LakeonPooledSession {
+                        client,
+                        aux: backend.aux.clone(),
+                        backend: Some(backend),
+                        checkout_guard,
+                        pool: pool.clone(),
+                        pool_key: pool_key.clone(),
+                        private_link_id,
+                        _cancel_on_shutdown: cancel_on_shutdown,
+                        _req: request_gauge,
+                        _conn: conn_gauge,
+                    },
+                )));
             }
-            Ok(Checkout::ReservedNew) => true,
+            Ok(Checkout::ReservedNew) => {
+                checkout_guard = Some(crate::lakeon_pooler::pool::CheckoutGuard::new(
+                    pool.as_ref().clone(),
+                    pool_key.clone(),
+                ));
+                true
+            }
             Err(CheckoutError::QueueTimeout) => {
                 let stats = pool.stats().await;
                 Metrics::get().proxy.lakeon_pooler_queue_timeout_total.inc();
@@ -484,6 +567,9 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 && let (Some(pool_key), Some(pool)) = (&lakeon_pool_key, &lakeon_backend_pool)
             {
                 pool.release_checked_out(pool_key).await;
+                if let Some(guard) = checkout_guard.as_mut() {
+                    guard.disarm();
+                }
             }
             return Err(e.into());
         }
@@ -498,32 +584,38 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
         let pool = lakeon_backend_pool.expect("Lakeon pooled endpoint requires backend pool");
         let pool_key = lakeon_pool_key.expect("pooled endpoint has a pool key");
         let aux = node.aux.clone();
-        Ok(Some(ProxyConnection::LakeonPooled(LakeonPooledSession {
-            client,
-            backend: Some(PooledBackend {
-                compute: node.stream.into_framed().into_inner(),
-                startup_replay: connected.startup_replay,
-                cancel_info: connected.cancel_info,
-                aux: aux.clone(),
-                _db_conn: node.guage,
-            }),
-            pool,
-            pool_key,
-            aux,
-            private_link_id,
+        Ok(Some(ProxyConnectionKind::LakeonPooled(
+            LakeonPooledSession {
+                client,
+                checkout_guard: checkout_guard.take(),
+                backend: Some(PooledBackend {
+                    compute: node.stream.into_framed().into_inner(),
+                    startup_replay: connected.startup_replay,
+                    cancel_info: connected.cancel_info,
+                    aux: aux.clone(),
+                    _db_conn: node.guage,
+                }),
+                pool,
+                pool_key,
+                aux,
+                private_link_id,
 
-            _cancel_on_shutdown: cancel_on_shutdown,
+                _cancel_on_shutdown: cancel_on_shutdown,
 
-            _req: request_gauge,
-            _conn: conn_gauge,
-        })))
+                _req: request_gauge,
+                _conn: conn_gauge,
+            },
+        )))
     } else {
         if lakeon_new_backend_reserved
             && let (Some(pool_key), Some(pool)) = (&lakeon_pool_key, &lakeon_backend_pool)
         {
             pool.release_checked_out(pool_key).await;
+            if let Some(guard) = checkout_guard.as_mut() {
+                guard.disarm();
+            }
         }
-        Ok(Some(ProxyConnection::Direct(ProxyPassthrough {
+        Ok(Some(ProxyConnectionKind::Direct(ProxyPassthrough {
             client,
             compute: node.stream.into_framed().into_inner(),
 

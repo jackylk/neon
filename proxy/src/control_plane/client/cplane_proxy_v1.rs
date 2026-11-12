@@ -46,6 +46,7 @@ pub struct NeonControlPlaneClient {
     // put in a shared ref so we don't copy secrets all over in memory
     jwt: Arc<str>,
     read_pool: Arc<ReadPoolRouter>,
+    shared_security: Option<Arc<crate::security::SharedSecurity>>,
 }
 
 impl NeonControlPlaneClient {
@@ -64,7 +65,16 @@ impl NeonControlPlaneClient {
             wake_compute_endpoint_rate_limiter,
             jwt,
             read_pool: Arc::new(ReadPoolRouter::new()),
+            shared_security: None,
         }
+    }
+
+    pub(crate) fn with_shared_security(
+        mut self,
+        shared: Option<Arc<crate::security::SharedSecurity>>,
+    ) -> Self {
+        self.shared_security = shared;
+        self
     }
 
     pub(crate) fn report_read_failure(&self, info: &ComputeUserInfo) {
@@ -367,6 +377,14 @@ impl NeonControlPlaneClient {
         ctx: &RequestContext,
         user_info: &ComputeUserInfo,
     ) -> Result<NodeInfo, WakeComputeError> {
+        if let Some(shared) = &self.shared_security {
+            shared
+                .wake(user_info.endpoint.as_str())
+                .await
+                .map_err(|_| {
+                    std::io::Error::other("shared wake request budget unavailable or exhausted")
+                })?;
+        }
         let request_id = ctx.session_id().to_string();
         let application_name = ctx.console_application_name();
         async {

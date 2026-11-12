@@ -79,6 +79,7 @@
 pub mod binary;
 
 mod admission;
+mod security;
 mod auth;
 mod batch;
 mod cache;
