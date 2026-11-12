@@ -35,6 +35,7 @@
 #include "extension_server.h"
 #include "file_cache.h"
 #include "neon.h"
+#include "public_query_limits.h"
 #include "neon_ddl_handler.h"
 #include "neon_lwlsncache.h"
 #include "neon_perf_counters.h"
@@ -509,6 +510,7 @@ _PG_init(void)
 	 */
 
 	/* Stage 1: Define GUCs, and other early intialization */
+	neon_public_query_limits_init();
 	pg_init_libpagestore();
 	relsize_hash_init();
 	lfc_init();
