@@ -57,6 +57,8 @@ impl Metrics {
 #[derive(MetricGroup)]
 #[metric(new())]
 pub struct ProxyMetrics {
+    pub security_audit_dropped_total: Counter,
+    pub security_audit_send_failures_total: Counter,
     #[metric(flatten)]
     pub db_connections: CounterPairVec<NumDbConnectionsGauge>,
     #[metric(flatten)]

@@ -1,4 +1,5 @@
 //! Shared security budgets. The cancellation Redis instance is reused, not its keys.
+mod audit;
 use std::future::Future;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -77,6 +78,7 @@ struct Reply {
 }
 
 pub(crate) struct SharedSecurity {
+    audit: audit::AuditQueue,
     redis: redis::Client,
     connection: Mutex<Option<MultiplexedConnection>>,
     endpoint: crate::http::Endpoint,
@@ -106,6 +108,7 @@ impl SharedSecurity {
         let redis = redis::Client::open(url)
             .map_err(|_| anyhow::anyhow!("invalid shared Redis configuration"))?;
         Ok(Arc::new(Self {
+            audit: audit::AuditQueue::default(),
             redis,
             connection: Mutex::new(None),
             endpoint,
@@ -138,6 +141,15 @@ impl SharedSecurity {
 
     fn key(kind: &str, id: &str) -> String {
         format!("{PREFIX}{kind}:{:x}", Sha256::digest(id.as_bytes()))
+    }
+    pub(crate) fn audit_denied(&self,ip:IpAddr,role:&str,database:Option<&str>,reason:&str) {
+        // Never include startup options, errors, passwords or SCRAM material.
+        let role:String=role.chars().filter(|c|!c.is_control()).take(128).collect();
+        self.audit.emit(self.endpoint.clone(),self.token.clone(),json!({
+            "id":uuid::Uuid::new_v4(),"occurredAt":chrono::Utc::now().to_rfc3339(),
+            "databaseId":database,"role":role,"source":ip.to_string(),
+            "action":if database.is_some(){"CONNECT"}else{"AUTHENTICATE"},"outcome":"DENIED","reason":reason
+        }));
     }
     async fn command(
         &self,

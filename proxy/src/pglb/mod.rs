@@ -403,7 +403,15 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
         };
         match admission {
             Ok(lease) => Some(lease),
-            Err(error) => return Err(client.throw_error(error, Some(ctx)).await.into()),
+            Err(error) => {
+                let reason=match &error {
+                    crate::security::SecurityError::Full=>"QUOTA_EXHAUSTED",
+                    crate::security::SecurityError::Limited=>"RATE_LIMITED",
+                    _=>"DEPENDENCY_UNAVAILABLE",
+                };
+                shared.audit_denied(ctx.peer_addr(),authenticated.security_role(),Some(&context.database_id),reason);
+                return Err(client.throw_error(error, Some(ctx)).await.into());
+            }
         }
     } else {
         None

@@ -60,6 +60,12 @@ impl AuthenticatedClient<'_> {
             auth::Backend::Local(_) => "",
         }
     }
+    pub(crate) fn security_role(&self) -> &str {
+        match &self.backend {
+            auth::Backend::ControlPlane(_,info)=>info.user.as_ref(),
+            auth::Backend::Local(_)=>"",
+        }
+    }
 
     pub(crate) fn is_lakeon_pooler_endpoint(&self) -> bool {
         match &self.backend {
@@ -180,6 +186,7 @@ pub(crate) async fn authenticate_client<'a, S: AsyncRead + AsyncWrite + Unpin + 
             )
             .await
         {
+            shared.audit_denied(ctx.peer_addr(), &user, None, "RATE_LIMITED");
             return Err(client.throw_error(error, Some(ctx)).await.into());
         }
     }
@@ -196,6 +203,9 @@ pub(crate) async fn authenticate_client<'a, S: AsyncRead + AsyncWrite + Unpin + 
     {
         Ok(auth_result) => auth_result,
         Err(e) => {
+            if let Some(shared)=&config.shared_security {
+                shared.audit_denied(ctx.peer_addr(),&user,None,"AUTHENTICATION_FAILED");
+            }
             let db = params.get("database");
             let app = params.get("application_name");
             let params_span = tracing::info_span!("", ?user, ?db, ?app);
