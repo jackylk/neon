@@ -47,9 +47,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> LakeonPooledSession<S> {
         let mut checkout_guard = self.checkout_guard.take();
         let mut backend = self.backend.take().expect("pooled backend is present");
         let result = proxy_transaction_aware(
-            crate::client_write_guard::ClientWriteGuard::new(self.client, self.client_write_timeout),
+            crate::client_write_guard::ClientWriteGuard::new(
+                self.client,
+                self.client_write_timeout,
+            ),
             &mut backend.compute,
-        ).await;
+        )
+        .await;
         if matches!(result, Ok(BackendTransactionStatus::Idle))
             && reset_backend(&mut backend.compute).await.is_ok()
         {
@@ -220,7 +224,20 @@ async fn forward_backend_until_ready(
     client: &mut (impl AsyncWrite + Unpin),
 ) -> Result<BackendTransactionStatus, ErrorSource> {
     loop {
-        let Some(backend) = read_frame(compute).await.map_err(ErrorSource::Compute)? else {
+        // Like the direct copy path, finish pending output before waiting for
+        // database computation. Keep this read future alive across the flush:
+        // read_frame may already have consumed a partial PostgreSQL header.
+        let next = read_frame(compute);
+        tokio::pin!(next);
+        let backend = match futures::poll!(next.as_mut()) {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => {
+                client.flush().await.map_err(ErrorSource::Client)?;
+                next.await
+            }
+        }
+        .map_err(ErrorSource::Compute)?;
+        let Some(backend) = backend else {
             return Err(ErrorSource::Compute(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "compute closed before ReadyForQuery",
@@ -235,6 +252,7 @@ async fn forward_backend_until_ready(
             .map_err(ErrorSource::Client)?;
 
         if let Some(status) = status {
+            client.flush().await.map_err(ErrorSource::Client)?;
             return Ok(status);
         }
     }
@@ -325,6 +343,120 @@ pub(crate) async fn write_pooler_error_to_pq_stream<S: AsyncWrite + Unpin>(
 mod tests {
     use super::*;
     use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn completed_query_does_not_carry_backpressure_into_next_query() {
+        let (mut server, mut compute) = tokio::io::duplex(256);
+        let (client, mut reader) = tokio::io::duplex(16);
+        let mut client = crate::client_write_guard::ClientWriteGuard::new(
+            client,
+            Some(Duration::from_millis(40)),
+        );
+        let producer = async {
+            server
+                .write_all(
+                    &PgFrame {
+                        tag: b'D',
+                        body: vec![1; 128],
+                    }
+                    .to_wire(),
+                )
+                .await
+                .unwrap();
+            server
+                .write_all(
+                    &PgFrame {
+                        tag: b'Z',
+                        body: vec![b'I'],
+                    }
+                    .to_wire(),
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            server
+                .write_all(
+                    &PgFrame {
+                        tag: b'Z',
+                        body: vec![b'I'],
+                    }
+                    .to_wire(),
+                )
+                .await
+                .unwrap();
+        };
+        let consumer = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            for tag in [b'D', b'Z', b'Z'] {
+                assert_eq!(read_frame(&mut reader).await.unwrap().unwrap().tag, tag);
+            }
+        };
+        let forward = async {
+            for query in 0..2 {
+                if query == 1 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                assert!(matches!(
+                    forward_backend_until_ready(&mut compute, &mut client).await,
+                    Ok(BackendTransactionStatus::Idle)
+                ));
+            }
+        };
+        timeout(Duration::from_secs(1), async {
+            tokio::join!(producer, consumer, forward);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovered_client_backpressure_does_not_time_database_computation() {
+        let (mut server, mut compute) = tokio::io::duplex(256);
+        let (client, mut reader) = tokio::io::duplex(16);
+        let mut client = crate::client_write_guard::ClientWriteGuard::new(
+            client,
+            Some(Duration::from_millis(40)),
+        );
+        let producer = async {
+            server
+                .write_all(
+                    &PgFrame {
+                        tag: b'D',
+                        body: vec![1; 128],
+                    }
+                    .to_wire(),
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            server
+                .write_all(
+                    &PgFrame {
+                        tag: b'Z',
+                        body: vec![b'I'],
+                    }
+                    .to_wire(),
+                )
+                .await
+                .unwrap();
+        };
+        let consumer = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert_eq!(read_frame(&mut reader).await.unwrap().unwrap().tag, b'D');
+            assert_eq!(read_frame(&mut reader).await.unwrap().unwrap().tag, b'Z');
+        };
+        let forward = async {
+            assert!(matches!(
+                forward_backend_until_ready(&mut compute, &mut client).await,
+                Ok(BackendTransactionStatus::Idle)
+            ));
+        };
+        timeout(Duration::from_secs(1), async {
+            tokio::join!(producer, consumer, forward);
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn rejected_parse_never_executes_previous_statement() {
