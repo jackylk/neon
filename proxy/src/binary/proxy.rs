@@ -159,7 +159,7 @@ struct ProxyCliArgs {
     /// Absolute deadline from admission through PostgreSQL authentication.
     #[clap(long, default_value = "30s", value_parser = humantime::parse_duration)]
     authentication_timeout: tokio::time::Duration,
-    /// Maximum continuous client output stall (defaults to 30s with shared security).
+    /// Maximum client output backpressure episode (defaults to 30s with shared security).
     #[clap(long, value_parser = humantime::parse_duration)]
     client_write_timeout: Option<tokio::time::Duration>,
     /// timeout for the TLS handshake
