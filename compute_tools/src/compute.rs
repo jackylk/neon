@@ -952,7 +952,10 @@ impl ComputeNode {
 
         // Configure and start rsyslog for compliance audit logging
         match pspec.spec.audit_log_level {
-            ComputeAudit::Hipaa | ComputeAudit::Extended | ComputeAudit::Full => {
+            ComputeAudit::Hipaa
+            | ComputeAudit::Extended
+            | ComputeAudit::Full
+            | ComputeAudit::Metadata => {
                 let remote_tls_endpoint =
                     std::env::var("AUDIT_LOGGING_TLS_ENDPOINT").unwrap_or("".to_string());
                 let remote_plain_endpoint =
@@ -2092,6 +2095,12 @@ impl ComputeNode {
     #[instrument(skip_all)]
     pub fn reconfigure(&self) -> Result<()> {
         let spec = self.state.lock().unwrap().pspec.clone().unwrap().spec;
+        if spec.audit_log_level == ComputeAudit::Metadata {
+            crate::rsyslog::verify_audit_rsyslog_identity(
+                spec.endpoint_id.as_deref().unwrap_or(""),
+                spec.project_id.as_deref().unwrap_or(""),
+            )?;
+        }
 
         let tls_config = self.tls_config(&spec);
 

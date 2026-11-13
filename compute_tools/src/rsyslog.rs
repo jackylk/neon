@@ -78,6 +78,21 @@ fn restart_rsyslog() -> Result<()> {
         .output()
         .context("Failed to restart rsyslogd")?;
 
+    // Containers do not have the VM's service supervisor. Start the daemon
+    // explicitly, with a writable pid file and the metadata-only audit config.
+    if Path::new("/etc/rsyslog.d/compute_audit_rsyslog.conf").exists() {
+        let status = Command::new("rsyslogd")
+            .args([
+                "-f",
+                "/etc/rsyslog.d/compute_audit_rsyslog.conf",
+                "-i",
+                "/var/run/rsyslogd/audit.pid",
+            ])
+            .status()
+            .context("Failed to start audit rsyslogd")?;
+        anyhow::ensure!(status.success(), "Audit rsyslogd failed to start");
+    }
+
     // ensure rsyslogd is running
     wait_for_rsyslog_pid()?;
 
@@ -153,6 +168,7 @@ pub fn configure_audit_rsyslog(
     remote_endpoint: &str,
     remote_tls_endpoint: &str,
 ) -> Result<()> {
+    fs::create_dir_all(Path::new(&log_directory).join("rsyslog-state"))?;
     let (remote_syslog_host, remote_syslog_port, remote_syslog_tls) =
         parse_audit_syslog_address(remote_endpoint, remote_tls_endpoint).unwrap();
     let config_content = generate_audit_rsyslog_config(
@@ -184,6 +200,46 @@ pub fn configure_audit_rsyslog(
     restart_rsyslog()?;
 
     Ok(())
+}
+
+/// Audit files and the forwarding queue belong to one runtime identity. A
+/// cross-tenant warm-pool bind must use the existing cold replacement path,
+/// rather than re-tagging unflushed records with the next tenant's identity.
+pub fn verify_audit_rsyslog_identity(endpoint: &str, project: &str) -> Result<()> {
+    let content = std::fs::read_to_string("/etc/rsyslog.d/compute_audit_rsyslog.conf")?;
+    anyhow::ensure!(
+        audit_identity_matches(&content, endpoint, project),
+        "Audit runtime identity change requires Compute replacement"
+    );
+    Ok(())
+}
+
+fn audit_identity_matches(content: &str, endpoint: &str, project: &str) -> bool {
+    if endpoint.is_empty()
+        || project.is_empty()
+        || endpoint.contains(['\"', '\n', '\r'])
+        || project.contains(['\"', '\n', '\r'])
+    {
+        return false;
+    }
+    [
+        format!("set $.json_log!endpoint_id = \"{endpoint}\";"),
+        format!("set $.json_log!project_id = \"{project}\";"),
+    ]
+    .iter()
+    .all(|expected| content.lines().filter(|line| *line == expected).count() == 1)
+}
+
+#[cfg(test)]
+mod metadata_identity_tests {
+    #[test]
+    fn warm_pool_cannot_retag_previous_tenant_audit() {
+        let content =
+            "set $.json_log!endpoint_id = \"branch-a\";\nset $.json_log!project_id = \"db-a\";\n";
+        assert!(super::audit_identity_matches(content, "branch-a", "db-a"));
+        assert!(!super::audit_identity_matches(content, "branch-b", "db-b"));
+        assert!(!super::audit_identity_matches(content, "branch-a", "db-b"));
+    }
 }
 
 /// Configuration for enabling Postgres logs forwarding from rsyslogd

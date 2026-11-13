@@ -514,6 +514,8 @@ impl Display for ComputeMode {
 /// Log level for audit logging
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 pub enum ComputeAudit {
+    /// Native audit metadata and row counts; SQL text and parameters are suppressed.
+    Metadata,
     #[default]
     Disabled,
     // Deprecated, use Base instead
@@ -576,7 +578,11 @@ pub struct Role {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum LakeonPublicLevel { Reader, Writer, Admin }
+pub enum LakeonPublicLevel {
+    Reader,
+    Writer,
+    Admin,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LakeonPublicAccess {

@@ -282,7 +282,10 @@ pub fn write_postgres_conf(
             }
             writeln!(file, "# Managed by compute_ctl base audit settings: end")?;
         }
-        ComputeAudit::Hipaa | ComputeAudit::Extended | ComputeAudit::Full => {
+        ComputeAudit::Hipaa
+        | ComputeAudit::Extended
+        | ComputeAudit::Full
+        | ComputeAudit::Metadata => {
             writeln!(
                 file,
                 "# Managed by compute_ctl compliance audit settings: begin"
@@ -295,6 +298,19 @@ pub fn write_postgres_conf(
             } else {
                 writeln!(file, "pgaudit.log_parameter=off")?;
                 writeln!(file, "pgaudit.log='all, -misc'")?;
+            }
+            if spec.audit_log_level == ComputeAudit::Metadata {
+                write_metadata_audit_settings(&mut file)?;
+                if let Some(classes) = spec.cluster.settings.find("pgaudit.log") {
+                    anyhow::ensure!(
+                        classes.split(',').all(|class| matches!(
+                            class,
+                            "none" | "ddl" | "role" | "write" | "read" | "function"
+                        )),
+                        "Invalid metadata audit classes"
+                    );
+                    writeln!(file, "pgaudit.log='{classes}'")?;
+                }
             }
             // Disable logging of catalog queries
             // The catalog doesn't contain sensitive data, so we don't need to audit it.
@@ -380,6 +396,30 @@ pub fn write_postgres_conf(
     writeln!(file, "include_if_exists = 'compute_ctl_temp_override.conf'")?;
 
     Ok(())
+}
+
+fn write_metadata_audit_settings(file: &mut impl std::io::Write) -> std::io::Result<()> {
+    writeln!(file, "log_timezone='GMT'")?;
+    writeln!(file, "pgaudit.log='none'")?;
+    writeln!(file, "pgaudit.log_statement=off")?;
+    writeln!(file, "pgaudit.log_parameter=off")?;
+    writeln!(file, "pgaudit.log_rows=on")?;
+    writeln!(file, "pgaudit.log_relation=on")
+}
+
+#[cfg(test)]
+mod metadata_audit_tests {
+    #[test]
+    fn metadata_profile_suppresses_text_and_parameters_and_records_rows() {
+        let mut output = Vec::new();
+        super::write_metadata_audit_settings(&mut output).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("pgaudit.log_statement=off\n"));
+        assert!(text.contains("pgaudit.log='none'\n"));
+        assert!(text.contains("pgaudit.log_parameter=off\n"));
+        assert!(text.contains("pgaudit.log_rows=on\n"));
+        assert!(text.contains("pgaudit.log_relation=on\n"));
+    }
 }
 
 pub fn with_compute_ctl_tmp_override<F>(pgdata_path: &Path, options: &str, exec: F) -> Result<()>

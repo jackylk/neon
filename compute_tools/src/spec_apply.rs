@@ -321,7 +321,7 @@ impl ComputeNode {
             // so that all config operations are audit logged.
             match spec.audit_log_level
             {
-                ComputeAudit::Hipaa | ComputeAudit::Extended | ComputeAudit::Full => {
+                ComputeAudit::Hipaa | ComputeAudit::Extended | ComputeAudit::Full | ComputeAudit::Metadata => {
                     phases.push(CreatePgauditExtension);
                     phases.push(CreatePgauditlogtofileExtension);
                     phases.push(DisablePostgresDBPgAudit);
@@ -1137,11 +1137,19 @@ async fn get_operations<'a>(
                         },
                     ];
                     for role in &spec.cluster.roles {
-                        if let Some(access)=&role.lakeon_public_access {
+                        if let Some(access) = &role.lakeon_public_access {
                             if access.enabled {
                                 operations.push(Operation {
-                                    query: crate::public_roles::grants(db.name.as_str(),db.owner.as_str(),role.name.as_str(),&access.level),
-                                    comment: Some(format!("applying customer grants for {}",role.name)),
+                                    query: crate::public_roles::grants(
+                                        db.name.as_str(),
+                                        db.owner.as_str(),
+                                        role.name.as_str(),
+                                        &access.level,
+                                    ),
+                                    comment: Some(format!(
+                                        "applying customer grants for {}",
+                                        role.name
+                                    )),
                                 });
                             }
                         }
@@ -1181,10 +1189,26 @@ async fn get_operations<'a>(
         // We do not consider data stored in this database as sensitive.
         ApplySpecPhase::DisablePostgresDBPgAudit => {
             let query = "ALTER DATABASE postgres SET pgaudit.log to 'none'";
-            Ok(Box::new(once(Operation {
+            let mut operations = vec![Operation {
                 query: query.to_string(),
                 comment: Some(query.to_string()),
-            })))
+            }];
+            if spec.audit_log_level == ComputeAudit::Metadata {
+                for database in &spec.cluster.databases {
+                    if database.name != PgIdent::from("postgres") {
+                        operations.push(Operation {
+                            query: format!(
+                                "ALTER DATABASE {} RESET pgaudit.log",
+                                database.name.pg_quote()
+                            ),
+                            comment: Some(
+                                "Use authoritative metadata audit policy on Compute start".into(),
+                            ),
+                        });
+                    }
+                }
+            }
+            Ok(Box::new(operations.into_iter()))
         }
         ApplySpecPhase::HandleNeonExtension => {
             let operations = vec![
