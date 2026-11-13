@@ -261,6 +261,9 @@ impl ComputeNode {
                         DeleteDBRoleReferences,
                         ChangeSchemaPerms,
                     ];
+                    if spec.audit_log_level == ComputeAudit::Metadata && matches!(&db, DB::UserDB(_)) {
+                        phases.push(PerDatabasePhase::CreateNativeAuditExtension);
+                    }
 
                     if spec.drop_subscriptions_before_start && !drop_subscriptions_done {
                         info!("Adding DropLogicalSubscriptions phase because drop_subscriptions_before_start is set");
@@ -508,6 +511,7 @@ impl Debug for DB {
 pub enum PerDatabasePhase {
     DeleteDBRoleReferences,
     ChangeSchemaPerms,
+    CreateNativeAuditExtension,
     /// This is a shared phase, used for both i) dropping dangling LR subscriptions
     /// before dropping the DB, and ii) dropping all subscriptions after creating
     /// a fresh branch.
@@ -1031,6 +1035,10 @@ async fn get_operations<'a>(
             }
 
             match subphase {
+                PerDatabasePhase::CreateNativeAuditExtension => Ok(Box::new(once(Operation {
+                    query: include_str!("sql/native_metadata_audit.sql").to_string(),
+                    comment: Some("Install managed audit hooks in the customer database".into()),
+                }))),
                 PerDatabasePhase::DropLogicalSubscriptions => {
                     match &db {
                         DB::UserDB(db) => {

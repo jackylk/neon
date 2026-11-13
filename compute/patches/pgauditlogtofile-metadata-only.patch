@@ -1,0 +1,116 @@
+--- a/logtofile.c
++++ b/logtofile.c
+@@ -40,6 +40,8 @@
+  * @param void
+  * @return void
+  */
++static int lakeon_metadata_version = 1;
++
+ void _PG_init(void)
+ {
+   BackgroundWorker worker;
+@@ -51,6 +53,10 @@
+                        errhint("Add pgauditlogtofile to the shared_preload_libraries configuration variable in postgresql.conf.")));
+   }
+ 
++  DefineCustomIntVariable("pgaudit.lakeon_metadata_version",
++      "Lakeon metadata producer version", NULL, &lakeon_metadata_version,
++      1, 1, 1, PGC_INTERNAL, 0, NULL, NULL, NULL);
++
+   /* guc variables */
+   DefineCustomStringVariable(
+       "pgaudit.log_directory",
+--- a/logtofile_log.c
++++ b/logtofile_log.c
+@@ -30,6 +30,7 @@
+ #include <storage/proc.h>
+ #include <tcop/tcopprot.h>
+ #include <utils/ps_status.h>
++#include <utils/guc.h>
+ 
+ #include <pthread.h>
+ #include <time.h>
+@@ -39,6 +40,51 @@
+ #define PGAUDIT_PREFIX_LINE "AUDIT: "
+ #define PGAUDIT_PREFIX_LINE_LENGTH sizeof(PGAUDIT_PREFIX_LINE) - 1
+ #define FORMATTED_TS_LEN 128
++
++/* Lakeon metadata mode must not export diagnostic SQL or user-controlled
++ * line breaks. Keep the upstream full-audit format when statement logging
++ * is explicitly enabled. */
++static bool lakeon_metadata_only(void)
++{
++  const char *setting = GetConfigOption("pgaudit.log_statement", true, false);
++  return setting == NULL || strcmp(setting, "off") == 0;
++}
++
++static bool lakeon_native_audit_origin(const ErrorData *edata)
++{
++  const char *filename;
++  if (edata->filename == NULL)
++    return false;
++  filename = strrchr(edata->filename, '/');
++  filename = filename == NULL ? edata->filename : filename + 1;
++  return strcmp(filename, "pgaudit.c") == 0;
++}
++
++static void lakeon_escape_metadata_line(StringInfo buf)
++{
++  StringInfoData safe;
++  int i;
++  initStringInfo(&safe);
++  for (i = 0; i < buf->len; i++)
++  {
++    unsigned char c = (unsigned char) buf->data[i];
++    if (c == '\\')
++      appendStringInfoString(&safe, "\\\\");
++    else if (c == '\n')
++      appendStringInfoString(&safe, "\\n");
++    else if (c == '\r')
++      appendStringInfoString(&safe, "\\r");
++    else if (c == '\t')
++      appendStringInfoString(&safe, "\\t");
++    else if (c < 32 || c == 127)
++      appendStringInfo(&safe, "\\x%02x", c);
++    else
++      appendStringInfoCharMacro(&safe, c);
++  }
++  resetStringInfo(buf);
++  appendBinaryStringInfo(buf, safe.data, safe.len);
++  pfree(safe.data);
++}
+ 
+ /*
+  * We really want line-buffered mode for logfile output, but Windows does
+@@ -80,10 +126,12 @@
+ {
+   int exclude_nchars = -1;
+ 
+-  if (pgauditlogtofile_is_enabled())
++  if (pgauditlogtofile_is_enabled() &&
++      (!lakeon_metadata_only() || lakeon_native_audit_origin(edata)))
+   {
+     // printf("ENABLE PRINTF\n");
+-    if (pg_strncasecmp(edata->message, PGAUDIT_PREFIX_LINE, PGAUDIT_PREFIX_LINE_LENGTH) == 0)
++    if (pg_strncasecmp(edata->message, PGAUDIT_PREFIX_LINE, PGAUDIT_PREFIX_LINE_LENGTH) == 0 &&
++        (!lakeon_metadata_only() || lakeon_native_audit_origin(edata)))
+     {
+       exclude_nchars = PGAUDIT_PREFIX_LINE_LENGTH;
+       edata->output_to_server = false;
+@@ -429,6 +477,16 @@
+   /* errmessage - PGAUDIT formatted text, +7 exclude "AUDIT: " prefix */
+   appendStringInfoString(buf, edata->message + exclude_nchars);
+   appendStringInfoCharMacro(buf, ',');
++
++  if (lakeon_metadata_only())
++  {
++    /* Nine empty diagnostic/application fields. In particular, application_name
++     * and function context cannot be used to inject a second audit record. */
++    appendStringInfoString(buf, ",,,,,,,,");
++    lakeon_escape_metadata_line(buf);
++    appendStringInfoCharMacro(buf, '\n');
++    return;
++  }
+ 
+   /* errdetail or errdetail_log */
+   if (edata->detail_log)

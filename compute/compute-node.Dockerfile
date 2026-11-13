@@ -1646,6 +1646,9 @@ RUN case "${PG_VERSION}" in \
     echo "${PGAUDITLOGTOFILE_CHECKSUM} pgauditlogtofile.tar.gz" | sha256sum --check && \
     mkdir pgauditlogtofile-src && cd pgauditlogtofile-src && tar xzf ../pgauditlogtofile.tar.gz --strip-components=1 -C .
 
+COPY compute/patches/pgauditlogtofile-metadata-only.patch /tmp/pgauditlogtofile-metadata-only.patch
+RUN patch -d /ext-src/pgauditlogtofile-src -p1 < /tmp/pgauditlogtofile-metadata-only.patch
+
 FROM pg-build AS pgauditlogtofile-build
 COPY --from=pgauditlogtofile-src /ext-src/ /ext-src/
 WORKDIR /ext-src/pgauditlogtofile-src

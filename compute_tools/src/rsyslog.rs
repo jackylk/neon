@@ -240,6 +240,18 @@ mod metadata_identity_tests {
         assert!(!super::audit_identity_matches(content, "branch-b", "db-b"));
         assert!(!super::audit_identity_matches(content, "branch-a", "db-b"));
     }
+    #[test]
+    fn last_metadata_record_is_flushed_without_a_following_query() {
+        let config = super::generate_audit_rsyslog_config(
+            "/tmp/log".into(),
+            "runtime",
+            "database",
+            "collector",
+            9881,
+            "false",
+        );
+        assert!(config.contains("readTimeout=\"1\""));
+    }
 }
 
 /// Configuration for enabling Postgres logs forwarding from rsyslogd
