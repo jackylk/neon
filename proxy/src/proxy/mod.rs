@@ -172,6 +172,10 @@ pub(crate) async fn authenticate_client<'a, S: AsyncRead + AsyncWrite + Unpin + 
     };
 
     let user = user_info.get_user().to_owned();
+    let audit_endpoint=match &user_info {
+        auth::Backend::ControlPlane(_,info)=>info.endpoint().map(str::to_owned),
+        auth::Backend::Local(_)=>None,
+    };
     if let Some(shared) = &config.shared_security {
         if let Err(error) = shared
             .pre_auth(
@@ -186,7 +190,7 @@ pub(crate) async fn authenticate_client<'a, S: AsyncRead + AsyncWrite + Unpin + 
             )
             .await
         {
-            shared.audit_denied(ctx.peer_addr(), &user, None, "RATE_LIMITED");
+            shared.audit_denied(ctx, &user, None, audit_endpoint.as_deref(), "RATE_LIMITED");
             return Err(client.throw_error(error, Some(ctx)).await.into());
         }
     }
@@ -204,7 +208,8 @@ pub(crate) async fn authenticate_client<'a, S: AsyncRead + AsyncWrite + Unpin + 
         Ok(auth_result) => auth_result,
         Err(e) => {
             if let Some(shared)=&config.shared_security {
-                shared.audit_denied(ctx.peer_addr(),&user,None,"AUTHENTICATION_FAILED");
+                let reason=if matches!(&e,crate::auth::AuthError::IpAddressNotAllowed(_)){"SOURCE_DENIED"}else{"AUTHENTICATION_FAILED"};
+                shared.audit_denied(ctx,&user,None,audit_endpoint.as_deref(),reason);
             }
             let db = params.get("database");
             let app = params.get("application_name");

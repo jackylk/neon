@@ -409,7 +409,7 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     crate::security::SecurityError::Limited=>"RATE_LIMITED",
                     _=>"DEPENDENCY_UNAVAILABLE",
                 };
-                shared.audit_denied(ctx.peer_addr(),authenticated.security_role(),Some(&context.database_id),reason);
+                shared.audit_denied(ctx,authenticated.security_role(),Some(&context.database_id),Some(authenticated.security_endpoint()),reason);
                 return Err(client.throw_error(error, Some(ctx)).await.into());
             }
         }

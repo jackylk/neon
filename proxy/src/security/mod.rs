@@ -142,12 +142,13 @@ impl SharedSecurity {
     fn key(kind: &str, id: &str) -> String {
         format!("{PREFIX}{kind}:{:x}", Sha256::digest(id.as_bytes()))
     }
-    pub(crate) fn audit_denied(&self,ip:IpAddr,role:&str,database:Option<&str>,reason:&str) {
+    pub(crate) fn audit_denied(&self,ctx:&crate::context::RequestContext,role:&str,database:Option<&str>,endpoint:Option<&str>,reason:&str) {
         // Never include startup options, errors, passwords or SCRAM material.
         let role:String=role.chars().filter(|c|!c.is_control()).take(128).collect();
         self.audit.emit(self.endpoint.clone(),self.token.clone(),json!({
             "id":uuid::Uuid::new_v4(),"occurredAt":chrono::Utc::now().to_rfc3339(),
-            "databaseId":database,"role":role,"source":ip.to_string(),
+            "databaseId":database,"role":role,"source":ctx.peer_addr().to_string(),
+            "sessionId":ctx.session_id(),"endpoint":endpoint.map(|e|e.chars().filter(|c|!c.is_control()).take(256).collect::<String>()),
             "action":if database.is_some(){"CONNECT"}else{"AUTHENTICATE"},"outcome":"DENIED","reason":reason
         }));
     }
