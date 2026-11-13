@@ -241,6 +241,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ipv6_allowlist_matches_only_the_authorized_family_and_prefix() {
+        let source: IpAddr="2001:db8:1::123".parse().unwrap();
+        let allowed: IpPattern="2001:db8:1::/64".parse().unwrap();
+        assert!(check_peer_addr_is_in_list(&source,&[allowed.clone()]));
+        assert!(!check_peer_addr_is_in_list(&"2001:db8:2::123".parse().unwrap(),&[allowed.clone()]));
+        assert!(!check_peer_addr_is_in_list(&"34.214.255.115".parse().unwrap(),&[allowed]));
+        assert!(!check_peer_addr_is_in_list(&source,&["2001:db8:1::124/128".parse().unwrap()]));
+        assert!("2001:db8::/129".parse::<IpPattern>().is_err());
+        assert!(check_peer_addr_is_in_list(&source,&[]));
+    }
+
+    #[test]
     fn parse_bare_minimum() -> anyhow::Result<()> {
         // According to postgresql, only `user` should be required.
         let options = StartupMessageParams::new([("user", "john_doe")]);
