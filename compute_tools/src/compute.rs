@@ -592,7 +592,7 @@ impl ComputeNode {
         // that can affect `compute_ctl` and prevent it from properly configuring the database schema.
         // Unset them via connection string options before connecting to the database.
         // N.B. keep it in sync with `ZENITH_OPTIONS` in `get_maintenance_client()`.
-        const EXTRA_OPTIONS: &str = "-c role=cloud_admin -c default_transaction_read_only=off -c search_path='' -c statement_timeout=0 -c pgaudit.log=none";
+        const EXTRA_OPTIONS: &str = "-c role=cloud_admin -c default_transaction_read_only=off -c search_path='' -c neon.public_query_limits=off -c statement_timeout=0 -c pgaudit.log=none";
         let options = match conn_conf.get_options() {
             // Allow the control plane to override any options set by the
             // compute
@@ -1932,7 +1932,7 @@ impl ComputeNode {
 
                     // It doesn't matter what were the options before, here we just want
                     // to connect and create a new superuser role.
-                    const ZENITH_OPTIONS: &str = "-c role=zenith_admin -c default_transaction_read_only=off -c search_path='' -c statement_timeout=0";
+                    const ZENITH_OPTIONS: &str = "-c role=zenith_admin -c default_transaction_read_only=off -c search_path='' -c neon.public_query_limits=off -c statement_timeout=0";
                     zenith_admin_conf.options(ZENITH_OPTIONS);
 
                     let mut client =
@@ -1984,7 +1984,8 @@ impl ComputeNode {
             // used in apply_spec_sql() should not take long (they are just creating users and installing
             // extensions). If any of them are stuck for an extended period of time it usually indicates a
             // pageserver connectivity problem and we should bail out.
-            conf.options("-c statement_timeout=2min");
+            let previous=conf.get_options().unwrap_or("").to_owned();
+            conf.options(&format!("{previous} -c neon.public_query_limits=off -c statement_timeout=2min"));
         }
 
         let conf = Arc::new(conf);
