@@ -950,6 +950,10 @@ impl ComputeNode {
             });
         }
 
+        // The Init watchdog must run even while a storage pre-task is blocked.
+        let _monitor_handle = launch_monitor(self);
+        let _configurator_handle = launch_configurator(self);
+
         // PGDATA preparation replaces the entire directory. Finish it before
         // creating audit state under PGDATA or starting any log forwarders.
         let rt = tokio::runtime::Handle::current();
@@ -1000,10 +1004,6 @@ impl ComputeNode {
         // Configure and start rsyslog for Postgres logs export
         let conf = PostgresLogsRsyslogConfig::new(pspec.spec.logs_export_host.as_deref());
         configure_postgres_logs_export(conf)?;
-
-        // Launch remaining service threads
-        let _monitor_handle = launch_monitor(self);
-        let _configurator_handle = launch_configurator(self);
 
         ////// START POSTGRES
         let start_time = Utc::now();
