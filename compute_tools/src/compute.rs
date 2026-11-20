@@ -950,6 +950,13 @@ impl ComputeNode {
             });
         }
 
+        // PGDATA preparation replaces the entire directory. Finish it before
+        // creating audit state under PGDATA or starting any log forwarders.
+        let rt = tokio::runtime::Handle::current();
+        while let Some(res) = rt.block_on(pre_tasks.join_next()) {
+            res??;
+        }
+
         // Configure and start rsyslog for compliance audit logging
         match pspec.spec.audit_log_level {
             ComputeAudit::Hipaa
@@ -997,12 +1004,6 @@ impl ComputeNode {
         // Launch remaining service threads
         let _monitor_handle = launch_monitor(self);
         let _configurator_handle = launch_configurator(self);
-
-        // Wait for all the pre-tasks to finish before starting postgres
-        let rt = tokio::runtime::Handle::current();
-        while let Some(res) = rt.block_on(pre_tasks.join_next()) {
-            res??;
-        }
 
         ////// START POSTGRES
         let start_time = Utc::now();
